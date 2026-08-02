@@ -187,14 +187,6 @@ adb -s <ip>:5555 shell dumpsys media_session | grep -m1 PlaybackState
 
 ---
 
-## Notes
-
-The script assumes one video app per box, which is normal for a dedicated tuner. It doesn't scope the decoder check to a specific package — deriving the foreground app during a tune proved unstable, and the identity comparison covers it. On a box running several video apps simultaneously, another app starting protected playback mid-tune could in principle satisfy the check.
-
-It also has no handling for profile prompts — "who's watching", "choose an account". If your app shows one, the gate will wait it out and time out. Handle those in your `bmitune.sh`.
-
-The `secureCodecId` parser depends on the current `dumpsys media.resource_manager` layout. Android or firmware updates can reshape that output. After a box update, run one tune with `DEBUG=1` and confirm detections still say `via codec` — if they all fall back to `via session`, the parser needs re-fitting.
-
 ## Thank you
 
 Thank you to [@sullrich](https://github.com/sullrich), [@bnhf](https://github.com/bnhf), and [@turtletank99](https://github.com/turtletank99) for the original `wait_for_video_playback_detection` idea in the excellent [ADBTuner](https://hub.docker.com/r/turtletank99/adbtuner).
