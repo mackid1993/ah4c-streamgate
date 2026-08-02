@@ -199,4 +199,4 @@ The `secureCodecId` parser depends on the current `dumpsys media.resource_manage
 
 ## Thank you
 
-Thank you to @sullrich, @bnhf, and @turtletank99 for the original idea in the excellent ADBTuner.
+Thank you to [@sullrich](https://github.com/sullrich), [@bnhf](https://github.com/bnhf), and [@turtletank99](https://github.com/turtletank99) for the original `wait_for_video_playback_detection` idea in the excellent [ADBTuner](https://hub.docker.com/r/turtletank99/adbtuner).
