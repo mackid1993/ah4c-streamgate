@@ -87,8 +87,6 @@ CMD2=/opt/scripts/streamgate.sh 2
 
 `TUNERn_IP` must include the adb port, normally `:5555`.
 
-> **Note:** setting `CMDn` moves that tuner off ah4c's network-encoder path, which is also where `NULL_FRAME_INSERTION` lives. That feature does not apply to a tuner using `CMDn`.
-
 ---
 
 ## Knobs
