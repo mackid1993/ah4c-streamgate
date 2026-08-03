@@ -478,8 +478,6 @@ func waitForVideo(ctx context.Context, c *config) error {
 	// as "not playing", which armed the fallback instantly.
 	haveBase := false
 	haveCodecBase := false
-	var pendingIDs []string
-	havePending := false
 	var baseIDs []string
 	var baseSet map[string]bool
 	armed := false
@@ -605,13 +603,9 @@ func waitForVideo(ctx context.Context, c *config) error {
 			// separately from this one, so a transient failure cannot make the
 			// outgoing channel's decoder look new -- and a permanent one cannot stop
 			// the session fallback from working.
-			if rmLegible {
-				if len(ids) > 0 {
-					haveCodecBase = true
-					baseIDs, baseSet = ids, setOf(ids)
-				} else {
-					pendingIDs, havePending = ids, true
-				}
+			if rmLegible && rmWhole(rm, ids) {
+				haveCodecBase = true
+				baseIDs, baseSet = ids, setOf(ids)
 			}
 			// The session has no identity, so it only counts once it has dropped at
 			// least once since we started -- otherwise a session left parked at
@@ -647,19 +641,11 @@ func waitForVideo(ctx context.Context, c *config) error {
 		// real detection. A transient truncation will not agree with the healthy
 		// poll after it; a genuinely idle box agrees with itself. Costs one poll,
 		// which MIN_WAIT covers.
-		if !haveCodecBase && rmLegible && complete {
-			// Only the EMPTY parse is ambiguous, so only it needs corroborating. A
-			// dump that lists decoders plainly parsed, and delaying that would let
-			// the baseline absorb the new channel's decoder -- a worse bug than the
-			// one being fixed.
-			if len(ids) > 0 || (havePending && len(pendingIDs) == 0) {
-				haveCodecBase = true
-				baseIDs, baseSet = ids, setOf(ids)
-				if c.debug {
-					logf(c, "codec baseline locked at poll %d: %s", polls, orNone(strings.Join(baseIDs, ",")))
-				}
-			} else {
-				pendingIDs, havePending = ids, true
+		if !haveCodecBase && rmLegible && complete && rmWhole(rm, ids) {
+			haveCodecBase = true
+			baseIDs, baseSet = ids, setOf(ids)
+			if c.debug {
+				logf(c, "codec baseline locked at poll %d: %s", polls, orNone(strings.Join(baseIDs, ",")))
 			}
 		}
 
@@ -929,10 +915,8 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 			}
 		default:
 		}
-		logf(c, "encoder unavailable before the gate opened (attempt %d: %v); redialling", attempt, err)
+		logf(c, "encoder unavailable, nothing emitted yet (attempt %d: %v); redialling", attempt, err)
 		select {
-		case <-gate:
-			return err
 		case <-ctx.Done():
 			return err
 		case <-time.After(500 * time.Millisecond):
@@ -1451,18 +1435,20 @@ func sectionComplete(pl []byte) bool {
 	return 3+(int(pl[1]&0x0f)<<8|int(pl[2])) <= len(pl)
 }
 
-// sameIDs reports whether two id lists name the same set.
-func sameIDs(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	sb := setOf(b)
-	for _, id := range a {
-		if !sb[id] {
-			return false
-		}
-	}
-	return true
+// rmWhole reports whether a resource dump can be trusted to have listed
+// EVERYTHING it has. A dump that names decoders has plainly parsed. A dump that
+// names none is the ambiguous case -- "there was nothing to list" and "I was cut
+// off before the list" are identical to a substring test -- so it is only
+// believed when the dump reached its terminator. Trusting the ambiguous case
+// installed an empty baseline, after which the OUTGOING channel's decoder read
+// as new and the gate opened on it.
+//
+// Two rounds of trying to corroborate this across polls made it worse: the
+// comparison was between two values that were empty by construction, so two
+// truncated dumps agreed trivially, and delaying the non-empty case let the
+// baseline swallow the new channel's decoder instead.
+func rmWhole(rm string, ids []string) bool {
+	return len(ids) > 0 || strings.Contains(rm, "Events logs")
 }
 
 // sameSet reports whether two pid sets are equal.

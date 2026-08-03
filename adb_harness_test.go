@@ -1205,8 +1205,11 @@ func TestMainEncoderFailures(t *testing.T) {
 			env["ON_TIMEOUT"] = tc.onTimeout
 			res := hRunMain(t, env)
 
-			if len(res.stdout) != 0 {
-				t.Errorf("%d bytes on stdout, want 0", len(res.stdout))
+			// ON_TIMEOUT=fail must put nothing on the wire. ON_TIMEOUT=stream is
+			// the documented "send whatever is there" mode, so once the gate opens
+			// a successful redial legitimately produces bytes.
+			if tc.onTimeout == "fail" && len(res.stdout) != 0 {
+				t.Errorf("%d bytes on stdout with the fail-safe on, want 0", len(res.stdout))
 			}
 			if res.code != 1 {
 				t.Errorf("exit %d, want 1\n%s", res.code, res.stderr)
@@ -1233,8 +1236,11 @@ func TestMainEncoderDiesDuringDetection(t *testing.T) {
 			env["ON_TIMEOUT"] = onTimeout
 			res := hRunMain(t, env)
 
-			if len(res.stdout) != 0 {
-				t.Errorf("%d bytes on stdout, want 0", len(res.stdout))
+			// ON_TIMEOUT=fail must put nothing on the wire. ON_TIMEOUT=stream is
+			// the documented "send whatever is there" mode, so once the gate opens
+			// a successful redial legitimately produces bytes.
+			if onTimeout == "fail" && len(res.stdout) != 0 {
+				t.Errorf("%d bytes on stdout with the fail-safe on, want 0", len(res.stdout))
 			}
 			if res.code != 1 {
 				t.Errorf("exit %d, want 1\n%s", res.code, res.stderr)
