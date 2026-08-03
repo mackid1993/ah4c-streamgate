@@ -33,9 +33,11 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -64,6 +66,7 @@ type config struct {
 	riseFactor    float64
 	motionHold    int
 	motionWindow  time.Duration
+	readTimeout   time.Duration
 	waitAudio     bool
 	renderTimeout time.Duration
 	debug         bool
@@ -188,6 +191,7 @@ func loadConfig() (*config, error) {
 		riseFactor:    envFloat("RISE_FACTOR", 5.0),
 		motionHold:    envInt("MOTION_HOLD", 3),
 		motionWindow:  envDur("MOTION_WINDOW", 250*time.Millisecond),
+		readTimeout:   envDur("READ_TIMEOUT", 10*time.Second),
 		waitAudio:     envBool("WAIT_AUDIO", false),
 		renderTimeout: envDur("RENDER_TIMEOUT", 3*time.Second),
 		debug:         envBool("DEBUG", false),
@@ -273,7 +277,13 @@ func mediaSessionState(dump string) string {
 func adbShell(ctx context.Context, ip, cmd string) string {
 	c, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(c, "adb", "-s", ip, "shell", cmd).Output()
+	// WaitDelay matters: without it Output() waits for EOF on pipes that the adb
+	// server daemon may have inherited, so it can block well past the context
+	// deadline -- and TUNE_TIMEOUT is only checked at the top of the poll loop,
+	// so nothing else would cut it short.
+	ec := exec.CommandContext(c, "adb", "-s", ip, "shell", cmd)
+	ec.WaitDelay = 2 * time.Second
+	out, err := ec.Output()
 	if err != nil {
 		return ""
 	}
@@ -282,7 +292,11 @@ func adbShell(ctx context.Context, ip, cmd string) string {
 
 // waitForVideo blocks until a new secure decoder has been seen `confirm` times.
 func waitForVideo(ctx context.Context, c *config) error {
-	exec.Command("adb", "connect", c.tunerIP).Run()
+	cc, ccCancel := context.WithTimeout(ctx, 10*time.Second)
+	connect := exec.CommandContext(cc, "adb", "connect", c.tunerIP)
+	connect.WaitDelay = 2 * time.Second
+	_ = connect.Run()
+	ccCancel()
 
 	// One round trip per poll: the resource dump, a marker, then the top
 	// PlaybackState line.
@@ -463,7 +477,7 @@ func videoPIDs(payload []byte) map[uint16]bool {
 	progInfoLen := int(uint16(payload[10]&0x0f)<<8 | uint16(payload[11]))
 	i := 12 + progInfoLen
 	end := 3 + sectionLen - 4 // minus CRC
-	for i+4 <= end && i+4 <= len(payload) {
+	for i+4 <= end && i+5 <= len(payload) {
 		st := payload[i]
 		epid := uint16(payload[i+1]&0x1f)<<8 | uint16(payload[i+2])
 		esLen := int(uint16(payload[i+3]&0x0f)<<8 | uint16(payload[i+4]))
@@ -521,6 +535,20 @@ func payload(p []byte, psi bool) []byte {
 	return b
 }
 
+// idleTimeoutConn fails a read that goes quiet for too long, instead of blocking
+// on it forever.
+type idleTimeoutConn struct {
+	net.Conn
+	idle time.Duration
+}
+
+func (c *idleTimeoutConn) Read(b []byte) (int, error) {
+	if c.idle > 0 {
+		_ = c.Conn.SetReadDeadline(time.Now().Add(c.idle))
+	}
+	return c.Conn.Read(b)
+}
+
 // ------------------------------------------------------------------ streaming
 
 // stream opens the encoder and copies it to stdout. If the gate has not opened
@@ -534,11 +562,27 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 	if err != nil {
 		return err
 	}
-	// Without a response-header timeout an encoder that accepts the TCP
-	// connection but never replies parks here forever, with no log and no exit,
-	// while the DVR waits.
+	// Two different hangs have to be closed off here.
+	//
+	// ResponseHeaderTimeout: an encoder that accepts the TCP connection but never
+	// replies would otherwise park forever, with no log and no exit, while the
+	// DVR waits. The dial timeout does not cover it -- the handshake succeeded.
+	//
+	// The read deadline is the more important one. Without it, an encoder that
+	// keeps the connection open but stops sending -- lost HDMI input, a wedged
+	// encode thread, a session limit hit mid-stream -- stalls the recording
+	// permanently and silently. TCP keepalive does not catch it, because the peer
+	// is still answering. Every successful read pushes the deadline out, so this
+	// only fires on genuine silence.
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	tr := &http.Transport{
-		DialContext:           (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := dialer.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			return &idleTimeoutConn{Conn: conn, idle: c.readTimeout}, nil
+		},
 		ResponseHeaderTimeout: 10 * time.Second,
 		DisableCompression:    true,
 		MaxIdleConnsPerHost:   1,
@@ -553,6 +597,7 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 	}
 
 	wrote := false
+	sent := 0
 	br := bufio.NewReaderSize(resp.Body, 1<<16)
 
 	// Coalesce writes without ever holding video back.
@@ -567,12 +612,17 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 	// immediately readable. Latency is identical to writing per packet -- nothing
 	// is ever held waiting for more data -- at a fraction of the syscalls.
 	out := os.Stdout
-	batch := make([]byte, 0, 64*tsPacketSize)
+	// 8 packets, not 64. The batch normally flushes the moment the reader runs
+	// dry, so it rarely fills -- but the cap is the worst-case hold time, and at
+	// 64 packets that ceiling was ~28ms of video sitting in memory. At 8 it is
+	// ~3.5ms, still an 8x cut in syscalls versus writing every packet.
+	batch := make([]byte, 0, 8*tsPacketSize)
 	flush := func() error {
 		if len(batch) == 0 {
 			return nil
 		}
-		_, err := out.Write(batch)
+		n, err := out.Write(batch)
+		sent += n
 		batch = batch[:0]
 		return err
 	}
@@ -634,7 +684,11 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 			if !wrote {
 				return fmt.Errorf("encoder sent no video (%v)", err)
 			}
-			return err
+			// The encoder ending the stream mid-recording is a failure however
+			// politely it closes. Reporting io.EOF as success truncated recordings
+			// with no log line at all.
+			return fmt.Errorf("encoder ended the stream after %s and %.1f MB (%v)",
+				time.Since(gateAt).Round(time.Second), float64(sent)/(1<<20), err)
 		}
 
 		p := pid(pkt)
@@ -787,6 +841,11 @@ func readPacket(br *bufio.Reader, pkt []byte) error {
 }
 
 func main() {
+	// os.Stdout raises SIGPIPE, which by default kills the process. That made the
+	// NORMAL end of every recording -- the DVR disconnecting -- look like a crash
+	// (exit 141), skip the write-error path entirely, and log nothing.
+	signal.Ignore(syscall.SIGPIPE)
+
 	c, err := loadConfig()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "streamgate:", err)
@@ -807,6 +866,16 @@ func main() {
 		logf(c, "TUNER%s_IP not set -- no gate", c.tuner)
 		close(gate)
 	} else if err := waitForVideo(ctx, c); err != nil {
+		// Surface an encoder failure that already happened, rather than blaming
+		// the box. Without this the only log is "no playback after 40s" while the
+		// real fault was a dead encoder noticed 40 seconds ago.
+		select {
+		case se := <-streamErr:
+			if se != nil {
+				logf(c, "encoder failed during detection: %v", se)
+			}
+		default:
+		}
 		logf(c, "%v", err)
 		if c.onTimeout == "fail" {
 			logf(c, "failing the tune rather than streaming whatever is on screen")
@@ -822,7 +891,13 @@ func main() {
 		close(gate)
 	}
 
-	if err := <-streamErr; err != nil && !errors.Is(err, io.EOF) && ctx.Err() == nil {
+	err = <-streamErr
+	switch {
+	case err == nil, ctx.Err() != nil:
+	case errors.Is(err, syscall.EPIPE), errors.Is(err, os.ErrClosed):
+		// The DVR hung up. That is how a recording normally ends.
+		logf(c, "stream closed by the DVR")
+	default:
 		logf(c, "stream ended: %v", err)
 		os.Exit(1)
 	}
