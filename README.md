@@ -161,27 +161,38 @@ If yours doesn't, you have two options, in order:
 
 ## Logs
 
-Every tune logs what decided it, and how long the gate actually held:
+Every tune logs one detection line and one alignment line:
 
 ```
 streamgate[1]: playback detected after 5s via codec 1284494944 (base none), 1 confirmation(s)
-streamgate[1]: aligned on pid 100 after 159 packets (29 KB, 0.21s) -- HAPPY: no meaningful wait (180ms, 2903 kbps vs 342 floor)
+streamgate[1]: aligned video-pid=100 discarded=159 packets/29KB gate-to-air=0.21s                waited-for-motion=180ms picture=2903kbps still-picture-floor=342kbps ratio=8.5x keyframes-skipped=0
 ```
 
-```
-streamgate[1]: aligned on pid 100 after 3271 packets (601 KB, 2.10s) -- SAD: held 1.99s for the loading screen, skipped 1 keyframe(s) (2903 kbps vs 342 floor)
-```
+What each number means:
 
-The hold time is what matters. A box that sleeps between tunes always shows a
-static picture before the gate opens, so the motion detector nearly always
-trips *after* the gate — even when it trips 200ms later and the tune is
-instant. A hold under 400ms is reported as no meaningful wait.
+| field | meaning |
+|---|---|
+| `playback detected after Ns` | time from the tuner being reserved until a decoder appeared. Mostly the box and the app; not much to do with this program. |
+| `via codec … (base …)` | which signal fired. `base` is what was allocated before tuning — a *changed* id is the proof of new playback. |
+| `video-pid` | the PID carrying the keyframe the stream started on. |
+| `discarded` | bytes dropped between the gate opening and that keyframe. These would have been undecodable to your DVR anyway. |
+| `gate-to-air` | **the number to watch.** Total time from the gate opening to the first byte sent. |
+| `waited-for-motion` | how much of `gate-to-air` was spent waiting for the picture to start moving. Small means the tune cost nothing extra; a second or more means it genuinely held through a loading screen. |
+| `picture` / `still-picture-floor` | current data rate versus the quietest the stream has been. The floor is the app's loading screen; the ratio between them is what triggers release. |
+| `ratio` | how many times above the floor. Release needs `RISE_FACTOR` (default 5×) sustained for `MOTION_HOLD` windows. |
+| `keyframes-skipped` | keyframes passed over while waiting. Non-zero means the loading screen outlived a full GOP. |
 
-On failure:
+A box that sleeps between tunes always shows a static picture before the gate
+opens, so the motion detector nearly always trips *after* it — including when it
+trips 200ms later and the tune is effectively instant. `waited-for-motion` is
+what separates those cases, not the mere fact that it tripped.
+
+When the gate can't confirm anything:
 
 ```
+streamgate[1]: aligned video-pid=100 discarded=412 packets/76KB gate-to-air=6.05s                waited-for-motion=6s(timeout, released anyway) keyframes-skipped=2
+streamgate[1]: no keyframe at all within 10s; streaming unaligned
 streamgate[1]: no playback after 40s (base=none)
-streamgate[1]: failing the tune rather than streaming whatever is on screen
 ```
 
 `DEBUG=1` adds a line per poll showing both detection signals and the arming state.

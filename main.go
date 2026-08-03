@@ -597,28 +597,30 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 			}
 			aligned = true
 			var path string
-			// Report how long the gate actually HELD, not merely whether the motion
-			// latch tripped after the gate opened. On a box that sleeps between
-			// tunes the pre-gate stream is always static, so the latch nearly
-			// always trips post-gate -- even when it trips 200ms later and the tune
-			// is instant. Keying the label off that branded fast tunes as slow.
+			// heldFor is the only number that says whether the gate cost anything.
+			// It is time spent waiting for the picture to start moving, measured from
+			// the gate opening. On a box that sleeps between tunes the stream is always
+			// static beforehand, so the detector nearly always trips after the gate --
+			// including when it trips 200ms later and the tune is effectively instant.
 			var heldFor time.Duration
 			if motionSeen && motionAt.After(gateAt) {
 				heldFor = motionAt.Sub(gateAt)
 			}
 			switch {
 			case !c.waitMotion:
-				path = "motion gate disabled"
+				path = fmt.Sprintf("motion-gate=off keyframes-skipped=%d", skippedKeys)
 			case !motionSeen:
-				path = fmt.Sprintf("no motion within %s; released anyway", c.motionTimeout)
-			case heldFor <= happyHold:
-				path = fmt.Sprintf("HAPPY: no meaningful wait (%.0fms, %.0f kbps vs %.0f floor)",
-					heldFor.Seconds()*1000, motionRate*8/1000, motionFloor*8/1000)
+				path = fmt.Sprintf("waited-for-motion=%s(timeout, released anyway) keyframes-skipped=%d",
+					c.motionTimeout, skippedKeys)
 			default:
-				path = fmt.Sprintf("SAD: held %.2fs for the loading screen, skipped %d keyframe(s) (%.0f kbps vs %.0f floor)",
-					heldFor.Seconds(), skippedKeys, motionRate*8/1000, motionFloor*8/1000)
+				path = fmt.Sprintf("waited-for-motion=%dms picture=%.0fkbps still-picture-floor=%.0fkbps ratio=%.1fx keyframes-skipped=%d",
+					heldFor.Milliseconds(), motionRate*8/1000, motionFloor*8/1000,
+					motionRate/motionFloor, skippedKeys)
 			}
-			logf(c, "aligned on pid %d after %d packets (%.0f KB, %.2fs) -- %s",
+			// video-pid  : which PID carried the keyframe we started on
+			// discarded  : bytes dropped between the gate opening and that keyframe
+			// gate-to-air: total time from the gate opening to the first byte out
+			logf(c, "aligned video-pid=%d discarded=%d packets/%.0fKB gate-to-air=%.2fs %s",
 				p, discarded, float64(discarded*tsPacketSize)/1024,
 				time.Since(gateAt).Seconds(), path)
 			if lastPAT != nil {
