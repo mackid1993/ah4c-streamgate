@@ -1,15 +1,9 @@
 name: build
 
-# `check` runs on pull requests, on tags, and on demand -- not on every push to
-# main. The full suite runs locally before anything is pushed; CI's job here is
-# to gate releases and contributions, not to re-run every commit.
-#
-# `build` and `release` stay on demand: push a v* tag, or start it by hand from
-# the Actions tab.
+# Manual only. Nothing runs on pushes, tags or pull requests -- start it from
+# the Actions tab. Leave release_tag empty to just check and build; set it
+# (e.g. v0.1.6) to also publish a release.
 on:
-  push:
-    tags: ['v*']
-  pull_request:
   workflow_dispatch:
     inputs:
       release_tag:
@@ -54,7 +48,6 @@ jobs:
 
   build:
     needs: check
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -90,7 +83,7 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           GOARM: ${{ matrix.goarm }}
         run: |
-          VERSION="${{ inputs.release_tag || github.ref_name }}"
+          VERSION="${{ inputs.release_tag || github.sha }}"
           NAME="streamgate-${{ matrix.suffix }}"
           go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o "$NAME" .
           sha256sum "$NAME" > "$NAME.sha256"
@@ -120,7 +113,7 @@ jobs:
   # releases with a partial set of assets.
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    if: inputs.release_tag != ''
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -140,7 +133,7 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.release_tag || github.ref_name }}
+          tag_name: ${{ inputs.release_tag }}
           files: dist/*
           generate_release_notes: true
           fail_on_unmatched_files: true
