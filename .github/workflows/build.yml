@@ -1,17 +1,13 @@
 name: build
 
-# Two different cadences on purpose.
-#
-# `check` runs on everything -- every push to main, every PR, every tag. The
-# tests encode bugs that were expensive to find, and gating them behind a tag
-# meant they did not run until someone cut a release, which is the one moment
-# you least want to discover a regression.
+# `check` runs on pull requests, on tags, and on demand -- not on every push to
+# main. The full suite runs locally before anything is pushed; CI's job here is
+# to gate releases and contributions, not to re-run every commit.
 #
 # `build` and `release` stay on demand: push a v* tag, or start it by hand from
 # the Actions tab.
 on:
   push:
-    branches: [main]
     tags: ['v*']
   pull_request:
   workflow_dispatch:
