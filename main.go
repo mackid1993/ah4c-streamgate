@@ -43,6 +43,8 @@ const (
 	// After ALIGN_TIMEOUT we stop insisting on motion and take any keyframe;
 	// this is the extra grace before giving up on alignment entirely.
 	relaxWindow = 2 * time.Second
+	// A hold shorter than this is not a wait worth calling a slow path.
+	happyHold = 400 * time.Millisecond
 )
 
 type config struct {
@@ -595,17 +597,26 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 			}
 			aligned = true
 			var path string
-			waitedForMotion := motionSeen && motionAt.After(gateAt)
+			// Report how long the gate actually HELD, not merely whether the motion
+			// latch tripped after the gate opened. On a box that sleeps between
+			// tunes the pre-gate stream is always static, so the latch nearly
+			// always trips post-gate -- even when it trips 200ms later and the tune
+			// is instant. Keying the label off that branded fast tunes as slow.
+			var heldFor time.Duration
+			if motionSeen && motionAt.After(gateAt) {
+				heldFor = motionAt.Sub(gateAt)
+			}
 			switch {
 			case !c.waitMotion:
 				path = "motion gate disabled"
-			case motionSeen && !waitedForMotion:
-				path = fmt.Sprintf("HAPPY: already moving when gate opened (%.0f kbps vs %.0f floor)", motionRate*8/1000, motionFloor*8/1000)
-			case waitedForMotion:
-				path = fmt.Sprintf("SAD: held %.2fs for the loading screen to end, skipped %d keyframe(s) (%.0f kbps vs %.0f floor)",
-					motionAt.Sub(gateAt).Seconds(), skippedKeys, motionRate*8/1000, motionFloor*8/1000)
+			case !motionSeen:
+				path = fmt.Sprintf("no motion within %s; released anyway", c.motionTimeout)
+			case heldFor <= happyHold:
+				path = fmt.Sprintf("HAPPY: no meaningful wait (%.0fms, %.0f kbps vs %.0f floor)",
+					heldFor.Seconds()*1000, motionRate*8/1000, motionFloor*8/1000)
 			default:
-				path = "no motion rise within " + c.motionTimeout.String() + "; took keyframe anyway"
+				path = fmt.Sprintf("SAD: held %.2fs for the loading screen, skipped %d keyframe(s) (%.0f kbps vs %.0f floor)",
+					heldFor.Seconds(), skippedKeys, motionRate*8/1000, motionFloor*8/1000)
 			}
 			logf(c, "aligned on pid %d after %d packets (%.0f KB, %.2fs) -- %s",
 				p, discarded, float64(discarded*tsPacketSize)/1024,

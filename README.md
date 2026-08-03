@@ -161,12 +161,21 @@ If yours doesn't, you have two options, in order:
 
 ## Logs
 
-Every tune logs what decided it:
+Every tune logs what decided it, and how long the gate actually held:
 
 ```
-streamgate[1]: playback detected after 5s via codec 1434699040 (base none), 1 confirmation(s)
-streamgate[1]: aligned to keyframe on pid 100 after discarding 159 packets (29 KB)
+streamgate[1]: playback detected after 5s via codec 1284494944 (base none), 1 confirmation(s)
+streamgate[1]: aligned on pid 100 after 159 packets (29 KB, 0.21s) -- HAPPY: no meaningful wait (180ms, 2903 kbps vs 342 floor)
 ```
+
+```
+streamgate[1]: aligned on pid 100 after 3271 packets (601 KB, 2.10s) -- SAD: held 1.99s for the loading screen, skipped 1 keyframe(s) (2903 kbps vs 342 floor)
+```
+
+The hold time is what matters. A box that sleeps between tunes always shows a
+static picture before the gate opens, so the motion detector nearly always
+trips *after* the gate — even when it trips 200ms later and the tune is
+instant. A hold under 400ms is reported as no meaningful wait.
 
 On failure:
 
@@ -175,7 +184,7 @@ streamgate[1]: no playback after 40s (base=none)
 streamgate[1]: failing the tune rather than streaming whatever is on screen
 ```
 
-`DEBUG=1` adds a line per poll showing both signals and the arming state.
+`DEBUG=1` adds a line per poll showing both detection signals and the arming state.
 
 ---
 
