@@ -1538,3 +1538,40 @@ func TestFlakyDumpsysDoesNotFalseLatchTheTerminator(t *testing.T) {
 		t.Errorf("want detection via codec NEW, got:\n%s", log)
 	}
 }
+
+// The terminator-withdrawal heals a false latch only when a terminator arrives
+// -- and a probe truncated before the markers never carries one. Three
+// dumpsys-death dumps latch trust and lock an empty baseline; a fourth probe
+// cut before __MS__ but after listing the OUTGOING decoder used to fire the
+// gate on it. The codec comparison now requires a complete probe, and a
+// complete probe with a terminator heals the latch in the same iteration,
+// before comparing.
+func TestTruncatedProbeCannotFireAgainstALatchedEmptyBaseline(t *testing.T) {
+	cut := "Processes:\n__MS__\n__MS2__\n"
+	oldBlock := "  Pid: 100\n    Id: OLD\n    {name: secure-codec, subType: video-codec, value: 1}\n"
+	newBlock := "  Pid: 200\n    Id: NEW\n    {name: secure-codec, subType: video-codec, value: 1}\n"
+	oldNoMarkers := "Processes:\n" + oldBlock // cut before __MS__
+	fullOld := "Processes:\n" + oldBlock + "Events logs:\n__MS__\n__MS2__\n"
+	fullOldNew := "Processes:\n" + oldBlock + newBlock + "Events logs:\n__MS__\n__MS2__\n"
+	hNewADB(t,
+		hStep{raw: cut},
+		hStep{raw: cut},
+		hStep{raw: cut},          // false latch, empty baseline under it
+		hStep{raw: oldNoMarkers}, // truncated probe naming the OUTGOING decoder
+		hStep{raw: fullOld},      // heals the latch, relocks the true baseline
+		hStep{raw: fullOldNew},   // only now does the new decoder appear
+		hStep{raw: fullOldNew},
+	)
+	c := hConfig()
+	c.tuneTimeout = 3 * time.Second
+	err, _, log := hWait(t, c)
+	if strings.Contains(log, "via codec OLD") {
+		t.Fatalf("a truncated probe fired the gate on the outgoing channel:\n%s", log)
+	}
+	if err != nil {
+		t.Fatalf("tune failed: %v\nlog:\n%s", err, log)
+	}
+	if !strings.Contains(log, "via codec NEW") {
+		t.Errorf("want detection via codec NEW after healing, got:\n%s", log)
+	}
+}

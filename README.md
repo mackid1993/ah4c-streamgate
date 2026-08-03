@@ -159,7 +159,7 @@ The defaults are tuned; most people should never touch these.
 | `WAIT_MOTION` | `1` | Wait for the picture to start moving before releasing. `0` releases on the first keyframe. |
 | `MOTION_WINDOW` | `0.25` | Seconds per measurement window. |
 | `DRAIN_IDLE` | `500us` | At handoff, discard video the encoder sent while we were still waiting on the box, so playback starts from live rather than from whatever had queued up. A read faster than this came from a buffer, not the network. `0` disables it. **Note the unit:** this is the only setting here measured in microseconds, and a bare number is read as seconds — `DRAIN_IDLE=1` means one second, which would discard the head of every recording. Catching up is also capped at 2s regardless. |
-| `MOTION_HOLD` | `3` | Consecutive windows above the threshold before it counts as motion. Filters out brief spikes from the cut itself. |
+| `MOTION_HOLD` | `3` | Consecutive windows above the threshold before it counts as motion. Filters out brief spikes from the cut itself. Keep it at `2` or higher — `1` lets a single window that straddles the gate (old picture on one side, card on the other) read as motion, and is only safe while `DRAIN_IDLE` stays on. |
 | `RISE_FACTOR` | `5` | How far above the quietest observed window a window must rise. A ratio, not a bitrate. |
 | `MOTION_TIMEOUT` | `6` | Give up waiting for motion after this long and release anyway. |
 | `REARM_MOTION` | `0` | The motion *latch* is always dropped at the gate; this additionally forgets the learned *floor* and re-learns it from the new channel. Only needed if a splash frame survives the default behaviour, at the cost of `MOTION_TIMEOUT` on switches that never show a card. |

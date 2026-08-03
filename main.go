@@ -740,7 +740,16 @@ func waitForVideo(ctx context.Context, c *config) error {
 		via := ""
 		playing := false
 		switch {
-		case haveCodecBase && newCodec(ids, baseSet) != "":
+		// `complete` as well: ids from a probe cut before the markers are a
+		// subset of the truth, which is safe against a SOUND baseline -- but
+		// against an empty baseline locked under the no-terminator latch, a
+		// truncated probe that kept its ids fired the gate on the outgoing
+		// channel through a shape the terminator-withdrawal cannot see (no
+		// terminator arrives on a probe with no tail). A complete probe carrying
+		// a terminator heals the latch in this same iteration, above, before
+		// this comparison runs. Costs one poll only when truncation lands on the
+		// exact poll that would have detected.
+		case haveCodecBase && complete && newCodec(ids, baseSet) != "":
 			playing, via = true, "codec "+newCodec(ids, baseSet)
 		case session == "playing" && armed:
 			playing, via = true, "session playing"
