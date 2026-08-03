@@ -95,6 +95,12 @@ type config struct {
 	waitAudio     bool
 	renderTimeout time.Duration
 	debug         bool
+
+	// Started media piids observed at tune start, snapshotted once alongside the
+	// codec baseline (only when WAIT_AUDIO is on). audioStarted compares against
+	// these so the outgoing channel's still-playing track cannot satisfy the
+	// render gate.
+	baseAudioPiids map[string]bool
 }
 
 // stdoutW is the stream sink. A var only so tests can substitute a buffer --
@@ -696,6 +702,17 @@ func waitForVideo(ctx context.Context, c *config) error {
 				baseIDs, baseSet = ids, setOf(ids)
 			}
 			baseSession = session
+			// The render gate needs its own identity baseline for the same reason
+			// the codec signal does. One extra adb call, once, only with the render
+			// gate enabled -- never on the polling hot path.
+			if c.waitAudio && c.baseAudioPiids == nil {
+				if dump := adbShell(ctx, c.tunerIP, "dumpsys audio", time.Until(deadline)); dump != "" {
+					c.baseAudioPiids = audioPiids(dump)
+					if c.debug {
+						logf(c, "audio baseline: %d started media piid(s)", len(c.baseAudioPiids))
+					}
+				}
+			}
 			if c.debug {
 				logf(c, "baseline codec=%s session=%s armed=%v (poll %d)",
 					orNone(strings.Join(baseIDs, ",")), session, armed, polls)
@@ -770,8 +787,47 @@ func orNone(s string) string {
 	return s
 }
 
-// audioStarted reports whether the app has an AudioTrack in the started state
-// carrying media content.
+// audioPiids returns the player ids of every audio track in the started state
+// carrying media content. Android assigns a piid per player, so like codec
+// client ids they carry identity -- which matters because "an audio track is
+// started" is ambiguous in exactly the way "a decoder exists" was: on a box
+// that resumes the previous channel on wake, the OUTGOING channel's track is
+// already started while the new channel's track sits created-but-stopped.
+// Verified live: at card-time the old piid was started and the new tune's
+// HW_AV_SYNC track had just been created in STATE_STOPPED.
+func audioPiids(dump string) map[string]bool {
+	out := map[string]bool{}
+	for _, line := range strings.Split(dump, "\n") {
+		if !strings.Contains(line, "state:started") {
+			continue
+		}
+		if !strings.Contains(line, "CONTENT_TYPE_MOVIE") &&
+			!strings.Contains(line, "CONTENT_TYPE_MUSIC") &&
+			!strings.Contains(line, "usage=USAGE_MEDIA") {
+			continue
+		}
+		// The classic dump prints "piid:111"; the toLogFriendlyString shape prints
+		// "ID:26". Either is a per-player identity.
+		id := ""
+		if i := strings.Index(line, "piid:"); i >= 0 {
+			id = line[i+len("piid:"):]
+		} else if i := strings.Index(line, "ID:"); i >= 0 {
+			id = line[i+len("ID:"):]
+		}
+		if f := strings.Fields(id); len(f) > 0 {
+			out[strings.TrimRight(f[0], ",;")] = true
+		} else {
+			// No identity token in this dump format: key on the line itself, which
+			// degrades identity comparison to the old shape-blind behaviour rather
+			// than dropping the track and breaking the fallback count.
+			out[strings.TrimSpace(line)] = true
+		}
+	}
+	return out
+}
+
+// audioStarted reports whether a NEW audio track -- one whose piid was not
+// started at tune start -- is in the started state carrying media content.
 //
 // This is the render signal, and it is why it matters: on a tunneled+secure
 // pipeline the video decoder is slaved to the audio hardware sync clock
@@ -790,18 +846,15 @@ func audioStarted(ctx context.Context, c *config, budget time.Duration) bool {
 	if dump == "" {
 		return false
 	}
-	for _, line := range strings.Split(dump, "\n") {
-		// No class-name requirement: builds that print
-		// AudioPlaybackConfiguration.toLogFriendlyString() omit it per line, and
-		// requiring it made WAIT_AUDIO a silent RENDER_TIMEOUT no-op there.
-		// state:started plus a media-content marker on one line is the evidence.
-		if !strings.Contains(line, "state:started") {
-			continue
-		}
-		// Ignore UI sounds; only real media counts.
-		if strings.Contains(line, "CONTENT_TYPE_MOVIE") ||
-			strings.Contains(line, "CONTENT_TYPE_MUSIC") ||
-			strings.Contains(line, "usage=USAGE_MEDIA") {
+	started := audioPiids(dump)
+	// Without a baseline -- the snapshot probe failed, or an old dump format
+	// carries no piid -- fall back to identity-blind: any started media track.
+	// Weaker, but never worse than the pre-identity behaviour.
+	if len(c.baseAudioPiids) == 0 {
+		return len(started) > 0
+	}
+	for piid := range started {
+		if !c.baseAudioPiids[piid] {
 			return true
 		}
 	}

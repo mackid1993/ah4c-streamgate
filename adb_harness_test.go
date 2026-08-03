@@ -1577,3 +1577,39 @@ func TestTruncatedProbeCannotFireAgainstALatchedEmptyBaseline(t *testing.T) {
 		t.Errorf("want detection via codec NEW after healing, got:\n%s", log)
 	}
 }
+
+// The render gate needs identity for the same reason the codec signal does: on
+// a box that resumes the previous channel on wake, the OUTGOING channel's audio
+// track is already started while the new channel's sits created-but-stopped --
+// verified live at card-time. A started track only counts if its piid was not
+// started at tune start.
+func TestAudioRenderGateRequiresANewPiid(t *testing.T) {
+	oldOnly := `  AudioPlaybackConfiguration piid:111 type:android.media.AudioTrack u/pid:10074/4545 state:started attr:AudioAttributes: usage=USAGE_MEDIA content=CONTENT_TYPE_MOVIE flags=0x810`
+	oldAndNew := oldOnly + "\n" + `  AudioPlaybackConfiguration piid:117 type:android.media.AudioTrack u/pid:10074/4545 state:started attr:AudioAttributes: usage=USAGE_MEDIA content=CONTENT_TYPE_MOVIE flags=0x810`
+
+	base := audioPiids(oldOnly)
+	if len(base) != 1 || !base["111"] {
+		t.Fatalf("audioPiids(baseline) = %v, want {111}", base)
+	}
+
+	a := hNewADB(t, hStep{ids: []string{"A"}})
+	c := hConfig()
+	c.baseAudioPiids = base
+
+	// The old channel's track alone must NOT confirm render.
+	a.setAudio(oldOnly)
+	if audioStarted(context.Background(), c, time.Second) {
+		t.Error("the outgoing channel's started track satisfied the render gate")
+	}
+	// A new piid must.
+	a.setAudio(oldAndNew)
+	if !audioStarted(context.Background(), c, time.Second) {
+		t.Error("a new started media piid did not confirm render")
+	}
+	// And with no baseline at all, fall back to identity-blind.
+	c.baseAudioPiids = nil
+	a.setAudio(oldOnly)
+	if !audioStarted(context.Background(), c, time.Second) {
+		t.Error("fallback without a baseline should accept any started media track")
+	}
+}

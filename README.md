@@ -174,7 +174,7 @@ If yours doesn't, you have two options, in order:
 
 **Raise `SETTLE`.** The decoder is allocated a little before the app puts real video on screen. `SETTLE` is a flat pause covering that gap; `0.5` or `0.75` is a reasonable next step. Cheap, but it's a timer — it doesn't know what's on screen, so it can be too short on a slow tune and wasted time on a fast one.
 
-**Or set `WAIT_AUDIO=1`.** This waits for the app to actually start audio playback before opening the gate. It's the stronger signal for exactly this problem: **a tuning card doesn't play audio.** An audio track reaching the started state means the stream itself is decoding, not merely that a decoder object exists. It costs the real time the box takes to begin playback — roughly 0.7s on the hardware this was developed against — and it is bounded by `RENDER_TIMEOUT` so a device that never reports audio still tunes.
+**Or set `WAIT_AUDIO=1`.** This waits for the app to start audio playback for the **new** tune before opening the gate — a *new* audio track id reaching the started state, compared against the tracks already playing at tune start, so the previous channel's still-running audio can't satisfy it. On these boxes it is the true render clock: video is tunneled and slaved to the audio hardware-sync output, so the first pixel cannot appear before that track runs (SurfaceFlinger is blind to tunneled video — measured, its frame timestamps stay zero throughout playback). It costs the real time the box takes to begin playback — roughly 0.7s — and is bounded by `RENDER_TIMEOUT` so a device that never reports audio still tunes.
 
 ---
 
