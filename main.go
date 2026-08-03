@@ -529,12 +529,25 @@ func waitForVideo(ctx context.Context, c *config) error {
 
 	hits := 0
 	adbFailures, polls, consecFailures, illegible := 0, 0, 0, 0
+	var elapsed time.Duration
+	// While the codec baseline is still unlocked, a decoder allocated between two
+	// polls lands INSIDE the next baseline and the primary signal is dead for the
+	// tune. That window is one poll wide, so poll tight until the baseline locks
+	// or two seconds pass -- whichever is first. Costs a handful of extra probes
+	// at the head of a tune with a flaky first dump, nothing on a healthy one.
+	nap := func() {
+		if !haveCodecBase && elapsed < 2*time.Second {
+			time.Sleep(c.confirmPoll)
+			return
+		}
+		time.Sleep(c.poll)
+	}
 	sawPlaying := false
 	noTerminator, noTermPolls := false, 0
 	var lastIDs []string
 	var lastSession, baseSession string
 	for {
-		elapsed := time.Since(start)
+		elapsed = time.Since(start)
 		if elapsed >= c.tuneTimeout {
 			// Say WHICH failure this was. adb being unreachable and the box simply
 			// not playing produced the same message, which is undiagnosable.
@@ -617,9 +630,15 @@ func waitForVideo(ctx context.Context, c *config) error {
 		rmLegible := strings.Contains(rm, "Processes:") || strings.Contains(rm, "Events logs")
 		// After enough legible dumps with no terminator, conclude this build does
 		// not print one rather than never locking a codec baseline at all.
-		if rmLegible && complete && !strings.Contains(rm, "Events logs") {
-			noTermPolls++
-			noTerminator = noTermPolls >= 3
+		if rmLegible && complete {
+			if !strings.Contains(rm, "Events logs") {
+				noTermPolls++
+				noTerminator = noTermPolls >= 3
+			} else {
+				// Consecutive, not cumulative: a build that prints the terminator
+				// sometimes has not proven it never does.
+				noTermPolls = 0
+			}
 		}
 		// A transport that truncates is the fault the reconnect exists for, so it
 		// counts like one -- and it has to count on EVERY poll, not just before the
@@ -641,7 +660,7 @@ func waitForVideo(ctx context.Context, c *config) error {
 		// One rule, one spelling, used at both sites below. They used to be written
 		// out twice and the two spellings differed -- the shape behind more of
 		// today's regressions than any other.
-		codecBaseOK := rmLegible && complete && rmWhole(rm, ids, noTerminator)
+		codecBaseOK := rmLegible && complete && rmWhole(rm, noTerminator)
 
 		// The session has no identity, so it only counts once it has dropped at
 		// least once since we started -- otherwise a session left parked at state=3
@@ -665,7 +684,7 @@ func waitForVideo(ctx context.Context, c *config) error {
 				// it made the timeout blame the network for a box that replied to
 				// every poll.
 				illegible++
-				time.Sleep(c.poll)
+				nap()
 				continue
 			}
 			haveBase = true
@@ -682,7 +701,7 @@ func waitForVideo(ctx context.Context, c *config) error {
 				logf(c, "baseline codec=%s session=%s armed=%v (poll %d)",
 					orNone(strings.Join(baseIDs, ",")), session, armed, polls)
 			}
-			time.Sleep(c.poll)
+			nap()
 			continue
 		}
 
@@ -732,7 +751,7 @@ func waitForVideo(ctx context.Context, c *config) error {
 			continue
 		}
 		hits = 0
-		time.Sleep(c.poll)
+		nap()
 	}
 }
 
@@ -938,6 +957,7 @@ var errNoPicture = errors.New("no picture")
 
 func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 	postGate := 0
+	var postGateAt time.Time
 	for attempt := 1; ; attempt++ {
 		wrote, err := streamOnce(ctx, c, gate)
 		// `wrote`, not the gate. streamOnce is blocked inside readPacket for up to
@@ -953,8 +973,15 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 		// permanently dead encoder must fail the tune rather than hold it open.
 		select {
 		case <-gate:
+			if postGateAt.IsZero() {
+				postGateAt = time.Now()
+			}
 			postGate++
-			if postGate > maxPostGateDials {
+			// Bounded by count AND wall clock. Each dial can block a full
+			// READ_TIMEOUT inside a silent connection, so the count bound alone let
+			// four dials hold the DVR ~41s; the budget for an encoder that has sent
+			// nothing since the gate opened is one READ_TIMEOUT in total.
+			if postGate > maxPostGateDials || time.Since(postGateAt) > c.readTimeout {
 				return err
 			}
 		default:
@@ -1536,30 +1563,20 @@ func sectionComplete(pl []byte) bool {
 }
 
 // rmWhole reports whether a resource dump can be trusted to have listed
-// EVERYTHING it has. A dump that names decoders has plainly parsed. A dump that
-// names none is the ambiguous case -- "there was nothing to list" and "I was cut
-// off before the list" are identical to a substring test -- so it is only
-// believed when the dump reached its terminator. Trusting the ambiguous case
-// installed an empty baseline, after which the OUTGOING channel's decoder read
-// as new and the gate opened on it.
+// EVERYTHING it has. "There was nothing to list" and "I was cut off before the
+// list" are identical to a substring test, so an empty dump is believed on one
+// of two grounds: it reached its terminator -- AOSP 11-16 all print "Events
+// logs" after the process list, verified against source and against the live
+// hardware -- or three consecutive complete polls have proven this build never
+// prints one, at which point a complete probe is the whole dump by construction
+// (the markers are echoed after it, and transport truncation is prefix loss).
 //
-// Two rounds of trying to corroborate this across polls made it worse: the
-// comparison was between two values that were empty by construction, so two
-// truncated dumps agreed trivially, and delaying the non-empty case let the
-// baseline swallow the new channel's decoder instead.
-//
-// A dump that names decoders is trusted ONLY on a box that has never shown the
-// terminator, because transport truncation lands at an arbitrary byte and can
-// cut after decoder #1 -- leaving a partial list that looks parsed, so decoder
-// #2 reads as new and the gate opens on the channel being left. AOSP 11-16 all
-// emit "Events logs" after the process list, so on real hardware the strict rule
-// holds; the relaxation exists so a vendor build that omits it does not lose the
-// primary detector entirely.
-func rmWhole(rm string, ids []string, noTerminator bool) bool {
-	if strings.Contains(rm, "Events logs") {
-		return true
-	}
-	return noTerminator && len(ids) > 0
+// Trusting an unterminated, unlatched dump installed an empty baseline, after
+// which the OUTGOING channel's decoder read as new and the gate opened on it.
+// The earlier per-poll corroboration schemes compared values that were empty by
+// construction and made this worse twice; the latch stays.
+func rmWhole(rm string, noTerminator bool) bool {
+	return strings.Contains(rm, "Events logs") || noTerminator
 }
 
 // sameSet reports whether two pid sets are equal.

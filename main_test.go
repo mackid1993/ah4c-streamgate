@@ -703,29 +703,30 @@ func TestParserBounds(t *testing.T) {
 
 // rmWhole is the whole defence against a truncated resource dump becoming the
 // codec baseline, and replacing its body with `return true` used to leave the
-// entire suite green.
+// entire suite green. An empty dump is believed only when it reached its
+// terminator, or when the latch has proven this build never prints one -- at
+// which point a complete probe IS the whole dump, so trust extends to the
+// empty list too (an idle box on such a build must not lose the codec signal).
 func TestRMWhole(t *testing.T) {
-	const whole = "Processes:\n  Pid: 1\n    Id: A\n    {name: secure-codec, subType: video-codec, value: 1}\nEvents logs:\n"
+	const term = "Processes:\n  Pid: 1\n    Id: A\n    {name: secure-codec, subType: video-codec, value: 1}\nEvents logs:\n"
+	const cut = "Processes:\n  Pid: 1\n    Id: A\n    {name: secure-codec, subType: video-codec, value: 1}\n  Pid: 2\n    Id: B"
 	cases := []struct {
 		name         string
 		rm           string
-		ids          []string
 		noTerminator bool
 		want         bool
 	}{
-		{"complete with a decoder", whole, []string{"A"}, false, true},
-		{"complete and idle", "Processes:\nEvents logs:\n", nil, false, true},
-		{"cut before any decoder", "Processes:\n  Pid: 1\n    Id:", nil, false, false},
-		// The dangerous shape: enough arrived to look parsed, so decoder #2 would
-		// read as new and open the gate on the channel being left.
-		{"cut after the first decoder", "Processes:\n  Pid: 1\n    Id: A\n    {name: secure-codec, subType: video-codec, value: 1}\n  Pid: 2\n    Id: B", []string{"A"}, false, false},
-		// ...unless this build has shown us it never prints a terminator, where
-		// refusing everything would kill the codec signal outright.
-		{"same, on a build with no terminator", "Processes:\n  Pid: 1\n    Id: A\n    {name: secure-codec, subType: video-codec, value: 1}\n  Pid: 2\n    Id: B", []string{"A"}, true, true},
-		{"idle, no terminator, relaxed", "Processes:\n", nil, true, false},
+		{"complete with terminator", term, false, true},
+		{"idle with terminator", "Processes:\nEvents logs:\n", false, true},
+		{"cut before the terminator, unlatched", cut, false, false},
+		{"cut before any decoder, unlatched", "Processes:\n  Pid: 1\n    Id:", false, false},
+		// Once the latch has proven the build prints no terminator, a complete
+		// probe is the whole dump by construction -- decoders listed or not.
+		{"no terminator, latched, with decoders", cut, true, true},
+		{"no terminator, latched, idle", "Processes:\n", true, true},
 	}
 	for _, c := range cases {
-		if got := rmWhole(c.rm, c.ids, c.noTerminator); got != c.want {
+		if got := rmWhole(c.rm, c.noTerminator); got != c.want {
 			t.Errorf("%s: rmWhole = %v, want %v", c.name, got, c.want)
 		}
 	}

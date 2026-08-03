@@ -1478,3 +1478,30 @@ func TestCodecBaselineNeedsACompleteProbe(t *testing.T) {
 		t.Errorf("an incomplete probe was accepted as the codec baseline:\n%s", log)
 	}
 }
+
+// A vendor build that never prints the "Events logs" terminator used to lose
+// the codec signal entirely while idle: an empty decoder list could never be
+// believed, so no baseline ever locked and a decoder that then appeared had
+// nothing to be compared against. Once three consecutive complete polls have
+// proven the build prints no terminator, a complete probe IS the whole dump,
+// and the empty baseline locks -- so the new decoder fires the gate.
+func TestNoTerminatorBuildStillGetsCodecSignal(t *testing.T) {
+	idle := "Processes:\n  Pid: 100\n__MS__\n__MS2__\n"
+	play := "Processes:\n  Pid: 100\n    Id: NEW\n    {name: secure-codec, subType: video-codec, value: 1}\n__MS__\n__MS2__\n"
+	hNewADB(t,
+		hStep{raw: idle},
+		hStep{raw: idle},
+		hStep{raw: idle}, // the latch proves the format on poll 3
+		hStep{raw: play},
+		hStep{raw: play},
+	)
+	c := hConfig()
+	c.tuneTimeout = 3 * time.Second
+	err, _, log := hWait(t, c)
+	if err != nil {
+		t.Fatalf("codec signal dead on a no-terminator build: %v\nlog:\n%s", err, log)
+	}
+	if !strings.Contains(log, "via codec NEW") {
+		t.Errorf("want detection via the codec signal, got:\n%s", log)
+	}
+}
