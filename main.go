@@ -420,17 +420,30 @@ func waitForVideo(ctx context.Context, c *config) error {
 
 	// One round trip per poll: the resource dump, a marker, then the top
 	// PlaybackState line.
-	const probe = "dumpsys media.resource_manager; echo __MS__; dumpsys media_session | grep -m1 PlaybackState || true"
+	// TWO markers. The first proves the resource dump finished; the second proves
+	// the session half did. One marker only ever proved the FIRST -- so output cut
+	// short after it looked exactly like "this box has no media session", which
+	// armed the fallback and let the outgoing channel's parked state=3 open the
+	// gate on the channel we were leaving.
+	const probe = "dumpsys media.resource_manager; echo __MS__; dumpsys media_session | grep -m1 PlaybackState; echo __MS2__"
 	// The marker is the discriminator. It is echoed unconditionally between the
 	// two halves, so seeing it proves the probe ran to completion -- and NOT
 	// seeing it proves the output was cut short, which `adb shell` exiting
 	// non-zero can no longer tell us on its own (a killed child and a grep that
 	// matched nothing both surface as an ExitError).
 	split := func(out string) (rm, ms string, complete bool) {
-		if i := strings.Index(out, "__MS__"); i >= 0 {
-			return out[:i], out[i+len("__MS__"):], true
+		i := strings.Index(out, "__MS__")
+		if i < 0 {
+			return out, "", false
 		}
-		return out, "", false
+		rest := out[i+len("__MS__"):]
+		j := strings.Index(rest, "__MS2__")
+		if j < 0 {
+			// The resource half arrived, the session half was cut off. Usable for
+			// the codec signal, but it says nothing about the session.
+			return out[:i], rest, false
+		}
+		return out[:i], rest[:j], true
 	}
 
 	// The baseline has to come from a probe that actually succeeded, so it is
@@ -446,7 +459,7 @@ func waitForVideo(ctx context.Context, c *config) error {
 	armed := false
 
 	hits := 0
-	adbFailures, polls, consecFailures := 0, 0, 0
+	adbFailures, polls, consecFailures, illegible := 0, 0, 0, 0
 	for {
 		elapsed := time.Since(start)
 		if elapsed >= c.tuneTimeout {
@@ -460,6 +473,10 @@ func waitForVideo(ctx context.Context, c *config) error {
 			if polls == 0 {
 				return fmt.Errorf("no playback after %ds -- the whole budget went to connecting to %s, so the box was never polled (raise TUNE_TIMEOUT, or check it is reachable)",
 					int(elapsed.Seconds()), c.tunerIP)
+			}
+			if illegible > 0 && illegible+adbFailures == polls {
+				return fmt.Errorf("no playback after %ds -- %s answered %d of %d polls but never returned a readable dump (does `adb -s %s shell dumpsys media.resource_manager` work?)",
+					int(elapsed.Seconds()), c.tunerIP, illegible, polls, c.tunerIP)
 			}
 			if adbFailures == polls {
 				return fmt.Errorf("no playback after %ds -- every adb call to %s failed or returned nothing (is adb reachable? does TUNER%s_IP include :5555?)",
@@ -491,7 +508,6 @@ func waitForVideo(ctx context.Context, c *config) error {
 			time.Sleep(c.poll)
 			continue
 		}
-		consecFailures = 0
 		rm, ms, complete := split(raw)
 		ids := secureCodecIDs(rm)
 		session := mediaSessionState(ms)
@@ -503,13 +519,29 @@ func waitForVideo(ctx context.Context, c *config) error {
 		// tears its MediaSession down mid-retune leave `armed` false forever, and
 		// on a box with no usable resource-manager signal that fails every tune.
 		sessionRead := complete && (strings.TrimSpace(ms) == "" || strings.Contains(ms, "PlaybackState"))
+		// Completeness is not legibility. A probe that finished but whose resource
+		// half says "Can't find service: media.resource_manager" -- a binder blip,
+		// a dumpsys timeout, the service restarting -- yields an EMPTY baseline,
+		// and then the outgoing channel's decoder reads as new on the next poll.
+		// Accept a baseline only from a half we could actually read.
+		legible := strings.Contains(rm, "Processes:") || strings.Contains(rm, "Events logs") ||
+			strings.Contains(ms, "PlaybackState")
+		// A truncated transport is a fault the reconnect exists for, so it has to
+		// keep counting toward consecFailures rather than resetting it.
+		if legible && complete {
+			consecFailures = 0
+		}
 		if !haveBase {
-			if !complete {
-				// Not a usable baseline: the probe was cut short, so the resource
-				// half may be a fragment that parses to no decoders at all -- and an
-				// empty baseline makes the outgoing channel's decoder read as new.
+			if !legible || !complete {
 				// Waiting costs a poll; accepting opens the gate on the old channel.
-				adbFailures++
+				// NOT counted as an adb failure when adb actually answered -- counting
+				// it made the timeout blame the network for a box that replied to
+				// every poll.
+				if legible || complete {
+					illegible++
+				} else {
+					adbFailures++
+				}
 				time.Sleep(c.poll)
 				continue
 			}
@@ -1134,13 +1166,17 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 			}
 		}
 
-		batch = append(batch, pkt...)
 		// Null padding and the tables are not a picture. An encoder that is muxing
-		// with no HDMI input emits nothing but those, and counting them recorded
-		// 91% stuffing and reported the tune a success.
-		if p != 0x1fff && p != 0 && !pmtPids[p] {
-			wrote = true
+		// with no HDMI input emits nothing but those, so until a real packet turns
+		// up none of it is queued: otherwise the flush below shovelled thousands of
+		// stuffing bytes at the DVR and only reported "encoder sent no video" at
+		// EOF, long after the bytes had gone.
+		picture := p != 0x1fff && p != 0 && !pmtPids[p]
+		if !wrote && !picture {
+			continue
 		}
+		batch = append(batch, pkt...)
+		wrote = true
 		// Flush as soon as nothing more has already arrived, or the batch is full.
 		// Never waits for data -- latency matches a per-packet write, at a fraction
 		// of the syscalls.

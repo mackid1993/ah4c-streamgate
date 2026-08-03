@@ -131,7 +131,9 @@ var (
 )
 
 // hProbeBody renders what the composite probe prints: the resource-manager
-// dump, the __MS__ marker, then the grepped PlaybackState line.
+// dump, the __MS__ marker, the grepped PlaybackState line, then __MS2__ --
+// matching the real probe, whose second marker is what proves the session half
+// finished rather than merely started.
 func hProbeBody(s hStep) string {
 	if s.raw != "" {
 		return s.raw
@@ -147,6 +149,7 @@ func hProbeBody(s hStep) string {
 	if s.session != "" {
 		b.WriteString(s.session + "\n")
 	}
+	b.WriteString("__MS2__\n")
 	return b.String()
 }
 
@@ -319,7 +322,7 @@ func TestWaitForVideoSurvivesManyFailedProbes(t *testing.T) {
 func TestWaitForVideoAcceptsAnUnparseableBaseline(t *testing.T) {
 	a := hNewADB(t,
 		// dumpsys is missing/failed, the marker and the grep still print.
-		hStep{raw: "Can't find service: media.resource_manager\n__MS__\n" + hStopped + "\n"},
+		hStep{raw: "Can't find service: media.resource_manager\n__MS__\n" + hStopped + "\n__MS2__\n"},
 		hStep{ids: []string{"OLD"}, session: hStopped},
 	)
 	err, _, log := hWait(t, hConfig())
@@ -843,7 +846,7 @@ func TestWaitForVideoDebugLog(t *testing.T) {
 // adb hands back CRLF; a stray \r inside the marker split or the PlaybackState
 // line breaks the string matching downstream.
 func TestAdbShellStripsCR(t *testing.T) {
-	hNewADB(t, hStep{raw: "Processes:\r\n  Id: A\r\n__MS__\r\n"})
+	hNewADB(t, hStep{raw: "Processes:\r\n  Id: A\r\n__MS__\r\n__MS2__\r\n"})
 	got := adbShell(context.Background(), "1.2.3.4", "probe", time.Second)
 	if got == "" {
 		t.Fatal("adbShell returned nothing")
