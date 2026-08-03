@@ -1,13 +1,12 @@
 name: build
 
+# Deliberately does NOT build on every push to main. It runs only when you ask
+# for it: push a v* tag, or start it by hand from the Actions tab.
 on:
   push:
-    branches: [main]
     tags: ['v*']
-  pull_request:
-    branches: [main]
   # Run it by hand from the Actions tab. Leave release_tag empty to just build
-  # and get binaries as artifacts; set it (e.g. v0.1.0) to also cut a release.
+  # and get binaries as artifacts; set it (e.g. v0.1.2) to also cut a release.
   workflow_dispatch:
     inputs:
       release_tag:
