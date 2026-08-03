@@ -143,8 +143,8 @@ The defaults are tuned; most people should never touch these.
 | `CONFIRM` | `1` | Consecutive sightings required before handing off. Raise to `2`+ if a splash frame slips through. |
 | `POLL` | `0.25` | Seconds between polls while waiting for a first sighting. |
 | `CONFIRM_POLL` | `0.05` | Seconds between polls once something has been sighted. Confirming is on the critical path, so it polls tight. |
-| `SETTLE` | `0.25` | Pause after detecting, before opening the gate. See "if a recording starts on the app's tuning screen" below. |
-| `MIN_WAIT` | `1` | Ignore "playing" for this many seconds after start. |
+| `SETTLE` | `0.25` | Pause after detecting, before opening the gate. `0` skips it. See "if a recording starts on the app's tuning screen" below. |
+| `MIN_WAIT` | `1` | Ignore "playing" for this many seconds after start. `0` accepts a sighting on the first poll. |
 | `TUNE_TIMEOUT` | `40` | Give up after this long. Costs nothing on a tune that works — the wait ends the moment playback is detected. |
 | `ON_TIMEOUT` | `fail` | `fail` exits without streaming, so your DVR sees a dead tune and can retry or pick another tuner. Anything else streams whatever is on screen. |
 | `ALIGN_KEYFRAME` | `1` | Start output on a keyframe. `0` streams from wherever the encoder happens to be — and because the motion gate runs while waiting to align, `0` turns `WAIT_MOTION` off too. |

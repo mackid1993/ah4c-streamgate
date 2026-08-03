@@ -126,23 +126,50 @@ func envBool(k string, def bool) bool {
 // ("10s", "250ms"). Users of a Go program reasonably type the latter, and
 // silently falling back to the default made misconfiguration invisible.
 func envDur(k string, def time.Duration) time.Duration {
+	return parseDur(k, def, false)
+}
+
+// envDurOff is envDur for the settings that document zero as "off" and branch on
+// it: SETTLE, MIN_WAIT and DRAIN_IDLE. envDur rejects 0 as invalid, which is
+// right for a poll interval but meant the documented value was silently replaced
+// by the default -- while warning the user that their input was wrong.
+func envDurOff(k string, def time.Duration) time.Duration {
+	return parseDur(k, def, true)
+}
+
+func parseDur(k string, def time.Duration, allowZero bool) time.Duration {
 	v := envRaw(k)
 	if v == "" {
 		return def
 	}
+	ok := func(d time.Duration) bool {
+		if allowZero {
+			return d >= 0
+		}
+		return d > 0
+	}
+	why := "must be positive"
+	if allowZero {
+		why = "must not be negative"
+	}
 	if d, err := time.ParseDuration(v); err == nil {
-		if d <= 0 {
-			warnEnv(k, v, "must be positive")
+		if !ok(d) {
+			warnEnv(k, v, why)
 			return def
 		}
 		return d
 	}
 	f, err := strconv.ParseFloat(v, 64)
-	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f <= 0 {
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
 		warnEnv(k, v, "want seconds (5, 0.25) or a duration (10s, 250ms)")
 		return def
 	}
-	return time.Duration(f * float64(time.Second))
+	d := time.Duration(f * float64(time.Second))
+	if !ok(d) {
+		warnEnv(k, v, why)
+		return def
+	}
+	return d
 }
 
 func envFloat(k string, def float64) float64 {
@@ -189,7 +216,7 @@ func loadConfig() (*config, error) {
 		// out the full TUNE_TIMEOUT while the log blamed the port.
 		tunerIP:     envRaw("TUNER" + n + "_IP"),
 		encoderURL:  envRaw("ENCODER" + n + "_URL"),
-		minWait:     envDur("MIN_WAIT", 1*time.Second),
+		minWait:     envDurOff("MIN_WAIT", 1*time.Second),
 		tuneTimeout: envDur("TUNE_TIMEOUT", 40*time.Second),
 		confirm:     envInt("CONFIRM", 1),
 		poll:        envDur("POLL", 250*time.Millisecond),
@@ -198,7 +225,7 @@ func loadConfig() (*config, error) {
 		// short settle here keeps keyframe alignment from landing on pre-render
 		// frames and showing a brief blue/black flash at the head of a recording.
 		// Far cheaper than waiting for the render signal proper (~0.7s).
-		settle:        envDur("SETTLE", 250*time.Millisecond),
+		settle:        envDurOff("SETTLE", 250*time.Millisecond),
 		onTimeout:     strings.ToLower(env("ON_TIMEOUT", "fail")),
 		alignKey:      envBool("ALIGN_KEYFRAME", true),
 		alignTimeout:  envDur("ALIGN_TIMEOUT", 8*time.Second),
@@ -208,7 +235,7 @@ func loadConfig() (*config, error) {
 		motionHold:    envInt("MOTION_HOLD", 3),
 		motionWindow:  envDur("MOTION_WINDOW", 250*time.Millisecond),
 		rearmMotion:   envBool("REARM_MOTION", false),
-		drainIdle:     envDur("DRAIN_IDLE", 500*time.Microsecond),
+		drainIdle:     envDurOff("DRAIN_IDLE", 500*time.Microsecond),
 		readTimeout:   envDur("READ_TIMEOUT", 10*time.Second),
 		waitAudio:     envBool("WAIT_AUDIO", false),
 		renderTimeout: envDur("RENDER_TIMEOUT", 3*time.Second),
@@ -351,14 +378,24 @@ func waitForVideo(ctx context.Context, c *config) error {
 	start := time.Now()
 	deadline := start.Add(c.tuneTimeout)
 
-	connect := func() {
-		cc, ccCancel := context.WithTimeout(ctx, adbCallTimeout)
+	// Bounded by what is left of TUNE_TIMEOUT, exactly like adbShell. `adb connect`
+	// to an address that blackholes takes 75s on its own, so with a flat ceiling a
+	// TUNE_TIMEOUT of 2s still ran 10s before the poll loop got its first
+	// iteration -- and the mid-wait reconnect could add another 10s on top.
+	connect := func(budget time.Duration) {
+		if budget <= 0 {
+			return
+		}
+		if budget > adbCallTimeout {
+			budget = adbCallTimeout
+		}
+		cc, ccCancel := context.WithTimeout(ctx, budget)
 		ec := exec.CommandContext(cc, "adb", "connect", c.tunerIP)
 		ec.WaitDelay = 2 * time.Second
 		_ = ec.Run()
 		ccCancel()
 	}
-	connect()
+	connect(time.Until(deadline))
 	lastConnect := time.Now()
 
 	// One round trip per poll: the resource dump, a marker, then the top
@@ -413,7 +450,7 @@ func waitForVideo(ctx context.Context, c *config) error {
 			// tuners cannot flood one adb server with reconnects.
 			if consecFailures >= 3 && time.Since(lastConnect) > 5*time.Second {
 				lastConnect = time.Now()
-				connect()
+				connect(time.Until(deadline))
 			}
 			// CONFIRM counts CONSECUTIVE sightings, so a poll that told us nothing
 			// breaks the run. Skipping this would let a sighting from before an adb
@@ -802,21 +839,20 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 			readStart = time.Now()
 		}
 		if err := readPacket(br, pkt); err != nil {
-			ferr := flush()
 			// An encoder with no input can answer 200 with an empty body. Treating
 			// that as a clean EOF exited 0 having sent the DVR nothing at all.
 			//
-			// This has to outrank the flush error below. A flush of the cached tables
-			// can fail with EPIPE, which main reads as the normal end of a recording
-			// and exits 0 -- so checking the flush first could report a tune that sent
-			// no video as a success.
+			// Checked BEFORE the flush, not after. The ALIGN_TIMEOUT fallback stages
+			// the cached PAT/PMT into the batch without setting `wrote`, so flushing
+			// first put those bytes on the wire for a tune that then reported it had
+			// sent no video. Nothing goes out on a tune that carried no picture.
 			if !wrote {
 				return fmt.Errorf("encoder sent no video (%v)", err)
 			}
 			// Prefer a failed final flush to the read error: if the DVR hung up, that
 			// is the real reason we are here and main treats it as the normal end of
 			// a recording, where blaming the encoder logged a false failure.
-			if ferr != nil {
+			if ferr := flush(); ferr != nil {
 				return ferr
 			}
 			// The encoder ending the stream mid-recording is a failure however
@@ -833,14 +869,22 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 
 		// Keep the newest program tables so a keyframe-aligned start is decodable
 		// immediately, instead of waiting for the encoder's next PSI cycle.
-		if p == 0 {
-			lastPAT = append(lastPAT[:0], pkt...)
-			if pl := payload(pkt, true); pl != nil {
-				if m := pmtPIDs(pl); len(m) > 0 {
-					pmtPids = m
+		//
+		// Only packets that START a section. A continuation packet carries no
+		// pointer_field and no table header, so parsing one yields garbage PIDs --
+		// and the len(m) > 0 guard below does not filter garbage, so that garbage
+		// replaced the real PMT PID and stopped the tables updating. Caching one
+		// would also inject a mid-section fragment as the DVR's first table.
+		if psiStart := pkt[1]&0x40 != 0; p == 0 {
+			if psiStart {
+				lastPAT = append(lastPAT[:0], pkt...)
+				if pl := payload(pkt, true); pl != nil {
+					if m := pmtPIDs(pl); len(m) > 0 {
+						pmtPids = m
+					}
 				}
 			}
-		} else if pmtPids[p] {
+		} else if pmtPids[p] && psiStart {
 			lastPMT = append(lastPMT[:0], pkt...)
 			if pl := payload(pkt, true); pl != nil {
 				if m := videoPIDs(pl); len(m) > 0 {
@@ -851,13 +895,15 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 
 		// Catch up to live before choosing a keyframe.
 		//
-		// We connect to the encoder early, because the motion gate has to watch the
-		// stream to learn what a still picture costs before it can recognise
-		// movement. That means the encoder is sending for several seconds while we
-		// are still waiting on the box, and anything we have not consumed sits in
-		// the socket buffer. Align without clearing it and we lock onto a keyframe
-		// that is ALREADY old, then stay exactly that far behind live for the whole
-		// recording -- video still arrives, it is just permanently late.
+		// Honest scope, because the original justification here overstated it: the
+		// pre-gate loop has no write, no sleep and no logging, so it consumes the
+		// encoder continuously and the socket buffer does NOT accumulate while we
+		// wait. What is actually sitting there at the gate is the 8KB read buffer
+		// plus whatever an encoder that bursts on connect handed over -- tens of
+		// milliseconds, not seconds. Expect `caught-up` to read a KB or two. It
+		// still earns its place: align without clearing it and we lock onto a
+		// keyframe that is already old and stay exactly that far behind live for
+		// the whole recording.
 		//
 		// So discard whatever was queued, and detect the end of the queue by timing
 		// the reads: buffered packets are handed over in microseconds, while at live
@@ -871,8 +917,9 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 		// exactly the loading-screen false positive the gate exists to prevent.
 		if draining {
 			if readWait < c.drainIdle && drained < maxDrain {
+				// Counted as `caught-up`, not `discarded`. Adding it to both made the
+				// aligned log line overstate the alignment discard by the drain.
 				drained++
-				discarded++
 				continue
 			}
 			draining = false
@@ -1041,6 +1088,16 @@ func main() {
 	// nothing. Bytes received before the gate opens are discarded, never emitted.
 	go func() { streamErr <- stream(ctx, c, gate) }()
 
+	// streamErr holds exactly one value. Track whether we have taken it, because
+	// taking it twice blocks forever with no sender left and the process dies with
+	// a Go "all goroutines are asleep" fatal error instead of the log line below.
+	// Reachable whenever the encoder fails during detection and ON_TIMEOUT is not
+	// "fail" -- most ordinarily when READ_TIMEOUT (10s) expires inside a much
+	// longer TUNE_TIMEOUT (40s), which an HDMI resync on the channel change is
+	// enough to cause.
+	var streamResult error
+	haveResult := false
+
 	if c.tunerIP == "" {
 		logf(c, "TUNER%s_IP not set -- no gate", c.tuner)
 		close(gate)
@@ -1050,6 +1107,7 @@ func main() {
 		// real fault was a dead encoder noticed 40 seconds ago.
 		select {
 		case se := <-streamErr:
+			streamResult, haveResult = se, true
 			if se != nil {
 				logf(c, "encoder failed during detection: %v", se)
 			}
@@ -1070,7 +1128,10 @@ func main() {
 		close(gate)
 	}
 
-	err = <-streamErr
+	if !haveResult {
+		streamResult = <-streamErr
+	}
+	err = streamResult
 	switch {
 	case err == nil, ctx.Err() != nil:
 	case errors.Is(err, syscall.EPIPE), errors.Is(err, os.ErrClosed):

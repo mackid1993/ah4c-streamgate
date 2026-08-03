@@ -454,3 +454,151 @@ func TestStreamUnalignedIsContiguous(t *testing.T) {
 		t.Fatal("unaligned output is not a contiguous run of the input")
 	}
 }
+
+// stallWriter blocks on one write, the way a DVR stalling on disk or network
+// does. Whatever it holds up delays the next measurement window close.
+type stallWriter struct {
+	buf   bytes.Buffer
+	n     int
+	after int
+	pause time.Duration
+}
+
+func (w *stallWriter) Write(p []byte) (int, error) {
+	w.n++
+	if w.n == w.after {
+		time.Sleep(w.pause)
+	}
+	return w.buf.Write(p)
+}
+
+// The realistic form of the dropped-packet bug: DEFAULT MOTION_WINDOW, and the
+// stall comes from the DVR rather than from a contrived window size. The other
+// stream tests use a 1ms window, which drops every packet -- useful, but not what
+// production looked like.
+func TestStreamSurvivesADVRStall(t *testing.T) {
+	input := buildStream(400, 40)
+	srv := serveTS(t, input, 2*time.Millisecond)
+	defer srv.Close()
+
+	c := testConfig(srv.URL)
+	c.motionWindow = 250 * time.Millisecond // the shipped default
+	c.readTimeout = 5 * time.Second
+
+	w := &stallWriter{after: 3, pause: 600 * time.Millisecond}
+	gate := make(chan struct{})
+	close(gate)
+
+	saved := stdoutW
+	stdoutW = w
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	_ = stream(ctx, c, gate)
+	cancel()
+	stdoutW = saved
+
+	checkContiguous(t, input, w.buf.Bytes(), false)
+}
+
+// A PSI continuation packet carries no table header. Parsing one yields garbage
+// PIDs that pass the len(m) > 0 guard, and caching one injects a mid-section
+// fragment as the DVR's first table.
+func TestStreamIgnoresPSIContinuation(t *testing.T) {
+	var input []byte
+	input = append(input, patPacket(0)...)
+	input = append(input, pmtPacket(0)...)
+	for i := 0; i < 5; i++ {
+		input = append(input, videoPacket(byte(i), false, byte(i+1))...)
+	}
+	// PID 0 with payload_unit_start CLEAR and a body that parses to nonsense.
+	cont := make([]byte, tsPacketSize)
+	cont[0], cont[1], cont[2], cont[3] = 0x47, 0x00, 0x00, 0x11
+	fill(cont, 4, 0x55)
+	input = append(input, cont...)
+	for i := 5; i < 40; i++ {
+		input = append(input, videoPacket(byte(i&0x0f), i%10 == 0, byte(i+1))...)
+	}
+
+	srv := serveTS(t, input, 3*time.Millisecond)
+	defer srv.Close()
+	gate := make(chan struct{})
+	close(gate)
+
+	out := runStream(t, testConfig(srv.URL), gate)
+	if len(out) < 2*tsPacketSize {
+		t.Fatalf("output is %d bytes, want the tables plus video", len(out))
+	}
+	if !bytes.Equal(out[:tsPacketSize], input[:tsPacketSize]) {
+		t.Error("injected PAT is not the real PAT -- a continuation packet was cached as a table")
+	}
+	if !bytes.Equal(out[tsPacketSize:2*tsPacketSize], input[tsPacketSize:2*tsPacketSize]) {
+		t.Error("injected PMT is not the real PMT")
+	}
+	checkContiguous(t, input, out, false)
+}
+
+// The fail-safe that matters most: a tune that carried no picture must put zero
+// bytes on the wire. The ALIGN_TIMEOUT fallback stages the cached tables into the
+// batch without setting `wrote`, and flushing those before the !wrote check put
+// 376 bytes out on a tune that then reported it had sent no video.
+func TestNoVideoMeansNoBytes(t *testing.T) {
+	var input []byte
+	input = append(input, patPacket(0)...)
+	input = append(input, pmtPacket(0)...)
+	for i := 0; i < 20; i++ { // video, but never a keyframe
+		input = append(input, videoPacket(byte(i&0x0f), false, byte(i+1))...)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fl, _ := w.(http.Flusher)
+		send := func(b []byte) {
+			if _, err := w.Write(b); err != nil {
+				return
+			}
+			if fl != nil {
+				fl.Flush()
+			}
+		}
+		send(input)
+		// Quiet past alignTimeout+relaxWindow, then one more packet so the loop
+		// wakes, trips the fallback, and immediately hits EOF.
+		time.Sleep(2400 * time.Millisecond)
+		send(videoPacket(1, false, 99))
+	}))
+	defer srv.Close()
+
+	c := testConfig(srv.URL)
+	c.alignTimeout = 100 * time.Millisecond
+	c.readTimeout = 6 * time.Second
+	gate := make(chan struct{})
+	close(gate)
+
+	out := runStream(t, c, gate)
+	if len(out) != 0 {
+		t.Errorf("stream put %d bytes on stdout for a tune with no decodable video; want 0", len(out))
+	}
+}
+
+// SETTLE, MIN_WAIT and DRAIN_IDLE document 0 as "off" and branch on it, so 0 has
+// to survive parsing. A poll interval still must not be zero.
+func TestZeroWhereItIsDocumented(t *testing.T) {
+	os.Setenv("ENCODER9_URL", "http://x")
+	os.Setenv("MIN_WAIT", "0")
+	os.Setenv("SETTLE", "0")
+	os.Setenv("DRAIN_IDLE", "0")
+	os.Setenv("POLL", "0")
+	os.Args = []string{"streamgate", "9"}
+	c, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.minWait != 0 || c.settle != 0 || c.drainIdle != 0 {
+		t.Errorf("minWait=%v settle=%v drainIdle=%v, want all zero", c.minWait, c.settle, c.drainIdle)
+	}
+	if c.poll == 0 {
+		t.Error("POLL=0 must be rejected -- it would busy-loop")
+	}
+	for _, k := range []string{"MIN_WAIT", "SETTLE", "DRAIN_IDLE", "POLL", "ENCODER9_URL"} {
+		os.Unsetenv(k)
+	}
+}
