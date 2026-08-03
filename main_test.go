@@ -836,9 +836,16 @@ func TestWrongPIDPMTStillRecords(t *testing.T) {
 	if len(out) == 0 {
 		t.Fatal("zero bytes out of an encoder streaming video continuously -- the PMT was trusted over observation to the end")
 	}
-	// What did come out must still be an unbroken run of the input's tail.
-	idx := bytes.Index(input, out)
-	if idx < 0 || idx%tsPacketSize != 0 || idx+len(out) != len(input) {
+	// The cached PAT and PMT are injected ahead of the first emitted packet --
+	// previously this mode delivered no tables at all. Strip them, then the rest
+	// must be an unbroken run of the input's tail.
+	if len(out) < 3*tsPacketSize || pid(out) != 0 || pid(out[tsPacketSize:]) != testPMTPid {
+		t.Fatalf("expected the cached PAT then PMT at the head, got pids %d, %d",
+			pid(out), pid(out[tsPacketSize:]))
+	}
+	rest := out[2*tsPacketSize:]
+	idx := bytes.Index(input, rest)
+	if idx < 0 || idx%tsPacketSize != 0 || idx+len(rest) != len(input) {
 		t.Fatal("post-relaxation output is not a contiguous run of the input")
 	}
 }
@@ -921,5 +928,50 @@ func TestPreGateMotionDoesNotReleaseOntoTheCard(t *testing.T) {
 	if start < dStart {
 		t.Errorf("output starts at packet %d, inside the loading card (card=%d..%d): pre-gate motion released alignment onto the card",
 			start, gateAt, dStart)
+	}
+}
+
+// The LinkPi emits an SDT (pid 0x11) every 500ms even when its HDMI input is
+// dead, and the "not a picture" rule only knew null/PAT/PMT -- so after the
+// align fallback the first SDT set `wrote` and a no-video mux streamed to the
+// DVR for the length of the programme, silently. A dead mux must FAIL with
+// zero bytes, however much SI it carries.
+func TestIdleMuxWithSDTStillFailsLoudly(t *testing.T) {
+	sdt := func(seq int) []byte {
+		p := make([]byte, tsPacketSize)
+		p[0], p[1], p[2], p[3] = 0x47, 0x40, 0x11, 0x10
+		fill(p, 4, seq)
+		return p
+	}
+	null := func(seq int) []byte {
+		p := make([]byte, tsPacketSize)
+		p[0], p[1], p[2], p[3] = 0x47, 0x1f, 0xff, 0x10
+		fill(p, 4, seq)
+		return p
+	}
+	var input []byte
+	seq := 1
+	for b := 0; b < 120; b++ { // ~7s at 3ms/pkt: PAT, PMT, SDT, nulls -- no video ever
+		input = append(input, patPacket(byte(b&0x0f))...)
+		input = append(input, pmtPacket(byte(b&0x0f))...)
+		input = append(input, sdt(seq)...)
+		seq++
+		for i := 0; i < 17; i++ {
+			input = append(input, null(seq)...)
+			seq++
+		}
+	}
+	srv := serveTS(t, input, 3*time.Millisecond)
+	defer srv.Close()
+
+	c := testConfig(srv.URL)
+	c.alignTimeout = 300 * time.Millisecond
+	c.readTimeout = time.Second
+	gate := make(chan struct{})
+	close(gate)
+
+	out := runStream(t, c, gate)
+	if len(out) != 0 {
+		t.Fatalf("a mux with no video streamed %d bytes to the DVR; want 0 and a loud failure", len(out))
 	}
 }

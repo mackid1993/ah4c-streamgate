@@ -537,7 +537,11 @@ func waitForVideo(ctx context.Context, c *config) error {
 	// at the head of a tune with a flaky first dump, nothing on a healthy one.
 	nap := func() {
 		if !haveCodecBase && elapsed < 2*time.Second {
-			time.Sleep(c.confirmPoll)
+			d := c.confirmPoll
+			if d > c.poll {
+				d = c.poll
+			}
+			time.Sleep(d)
 			return
 		}
 		time.Sleep(c.poll)
@@ -605,7 +609,7 @@ func waitForVideo(ctx context.Context, c *config) error {
 			// breaks the run. Skipping this would let a sighting from before an adb
 			// failure combine with one after it to satisfy CONFIRM across a gap.
 			hits = 0
-			time.Sleep(c.poll)
+			nap()
 			continue
 		}
 		rm, ms, complete := split(raw)
@@ -797,9 +801,10 @@ func audioStarted(ctx context.Context, c *config, budget time.Duration) bool {
 		return false
 	}
 	for _, line := range strings.Split(dump, "\n") {
-		if !strings.Contains(line, "AudioPlaybackConfiguration") {
-			continue
-		}
+		// No class-name requirement: builds that print
+		// AudioPlaybackConfiguration.toLogFriendlyString() omit it per line, and
+		// requiring it made WAIT_AUDIO a silent RENDER_TIMEOUT no-op there.
+		// state:started plus a media-content marker on one line is the evidence.
 		if !strings.Contains(line, "state:started") {
 			continue
 		}
@@ -993,8 +998,9 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 			postGate++
 			// Bounded by count AND wall clock. Each dial can block a full
 			// READ_TIMEOUT inside a silent connection, so the count bound alone let
-			// four dials hold the DVR ~41s; the budget for an encoder that has sent
-			// nothing since the gate opened is one READ_TIMEOUT in total.
+			// four dials hold the DVR ~41s. The clock is checked BETWEEN attempts,
+			// so the worst hold is one full attempt beyond READ_TIMEOUT, not
+			// READ_TIMEOUT itself.
 			if postGate > maxPostGateDials || time.Since(postGateAt) > c.readTimeout {
 				return err
 			}
@@ -1087,10 +1093,7 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) (wrote boo
 	}
 
 	var lastPAT, lastPMT []byte
-	// One helper, three release paths: ALIGN_KEYFRAME=0, the ALIGN_TIMEOUT
-	// fallback, and alignment succeeding. Written out three times, one copy was
-	// simply missing -- the DVR then waited for the encoder's next PSI cycle in
-	// that mode, delivering strictly less than a plain byte copy.
+	// Called exactly once, immediately before the first emitted packet.
 	injectTables := func() {
 		if lastPAT != nil {
 			batch = append(batch, lastPAT...)
@@ -1139,11 +1142,6 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) (wrote boo
 				draining = c.drainIdle > 0
 				if !c.alignKey {
 					aligned = true
-					// Same reasoning as the ALIGN_TIMEOUT fallback: without this the
-					// DVR waits for the encoder's next PSI cycle, and the !wrote
-					// guard drops the stream's own leading tables on the way past --
-					// so this mode delivered strictly less than a plain byte copy.
-					injectTables()
 				}
 				// Motion observed before the gate is ALWAYS evidence about the
 				// previous picture -- the wake animation, the home screen, the app
@@ -1182,9 +1180,6 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) (wrote boo
 		if open && !aligned && time.Since(gateAt) > c.alignTimeout+relaxWindow {
 			aligned, alignGaveUp = true, true
 			logf(c, "no keyframe recognised within %s; streaming unaligned (encoder may not signal random access -- try ALIGN_KEYFRAME=0)", c.alignTimeout+relaxWindow)
-			// Still send the tables, otherwise the DVR has to wait for the
-			// encoder's next PSI cycle on top of everything else.
-			injectTables()
 		}
 
 		var readStart time.Time
@@ -1426,7 +1421,6 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) (wrote boo
 				p, discarded, float64(discarded*tsPacketSize)/1024,
 				float64(drained*tsPacketSize)/1024,
 				time.Since(gateAt).Seconds(), path)
-			injectTables()
 		}
 
 		// Null padding and the tables are not a picture. An encoder that is muxing
@@ -1447,7 +1441,13 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) (wrote boo
 			// suppressed: zero bytes out of an encoder streaming video continuously,
 			// and a log blaming the HDMI input. Once alignment has given up on
 			// recognising video, so does this.
-			notPicture := p == 0x1fff || p == 0 || pmtPids[p]
+			// All reserved SI pids, not just PAT: DVB reserves 0x00-0x1F (the
+			// LinkPi emits an SDT on 0x11 every 500ms even with no HDMI input),
+			// and 0x1FFB is ATSC PSIP. Excluding only null/PAT/PMT let the first
+			// SDT after the align fallback set `wrote`, and a dead mux then
+			// streamed to the DVR for the length of the programme -- the silent
+			// outcome errNoPicture exists to prevent.
+			notPicture := p < 0x20 || p == 0x1ffb || p == 0x1fff || pmtPids[p]
 			if len(vidPids) > 0 && !alignGaveUp {
 				notPicture = !vidPids[p]
 			}
@@ -1480,6 +1480,15 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) (wrote boo
 				}
 				continue
 			}
+		}
+		// The one injection site, for every release path: immediately before the
+		// first emitted packet. Three separate sites diverged twice today -- one
+		// was missing entirely, and one fired at gate-open before anything had
+		// been cached, so ALIGN_KEYFRAME=0 with the gate already open delivered
+		// no tables at all while suppressing the encoder's own. The tables are
+		// cached while being suppressed, so they are always the newest seen.
+		if !wrote {
+			injectTables()
 		}
 		batch = append(batch, pkt...)
 		wrote = true

@@ -916,14 +916,13 @@ func TestAudioStarted(t *testing.T) {
 		{"idle", `    AudioPlaybackConfiguration: ID:26 -- state:idle -- attr: usage=USAGE_MEDIA content=CONTENT_TYPE_MOVIE`, false},
 		{"a UI sound is not media", `    AudioPlaybackConfiguration: ID:3 -- state:started -- attr: usage=USAGE_ASSISTANCE_SONIFICATION content=CONTENT_TYPE_SONIFICATION`, false},
 		{"nothing at all", "", false},
-		// BUG (main.go:562): the three tokens must be on ONE line, including the
-		// literal class name. AudioPlaybackConfiguration.toLogFriendlyString() --
-		// what `dumpsys audio` prints under "playback configurations:" on the
-		// builds this was checked against -- does not repeat the class name per
-		// line. On any device that prints this shape, WAIT_AUDIO is a silent
-		// RENDER_TIMEOUT-long no-op that reports "render not confirmed".
+		// AudioPlaybackConfiguration.toLogFriendlyString() -- what `dumpsys audio`
+		// prints under "playback configurations:" on many builds -- does not
+		// repeat the class name per line. Requiring it made WAIT_AUDIO a silent
+		// RENDER_TIMEOUT no-op on those devices; state:started plus a media
+		// marker on one line is the evidence, class name or not.
 		{"toLogFriendlyString shape without the class name", `  playback configurations:
-    ID:26 -- type: android.media.MediaPlayer -- u/pid:10099/4529 -- state:started -- attr:AudioAttributes: usage=USAGE_MEDIA content=CONTENT_TYPE_MOVIE flags=0x0`, false},
+    ID:26 -- type: android.media.MediaPlayer -- u/pid:10099/4529 -- state:started -- attr:AudioAttributes: usage=USAGE_MEDIA content=CONTENT_TYPE_MOVIE flags=0x0`, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
