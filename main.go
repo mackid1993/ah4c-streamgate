@@ -72,12 +72,17 @@ type config struct {
 	riseFactor    float64
 	motionHold    int
 	motionWindow  time.Duration
+	rearmMotion   bool
 	drainIdle     time.Duration
 	readTimeout   time.Duration
 	waitAudio     bool
 	renderTimeout time.Duration
 	debug         bool
 }
+
+// stdoutW is the stream sink. A var only so tests can substitute a buffer --
+// nothing but stream bytes may ever be written here.
+var stdoutW io.Writer = os.Stdout
 
 func logf(c *config, format string, a ...interface{}) {
 	fmt.Fprintf(os.Stderr, "streamgate[%s]: %s\n", c.tuner, fmt.Sprintf(format, a...))
@@ -177,9 +182,13 @@ func loadConfig() (*config, error) {
 	}
 	n := os.Args[1]
 	c := &config{
-		tuner:       n,
-		tunerIP:     os.Getenv("TUNER" + n + "_IP"),
-		encoderURL:  os.Getenv("ENCODER" + n + "_URL"),
+		tuner: n,
+		// Through envRaw like everything else. docker --env-file does not strip
+		// quotes, and a TUNER1_IP="10.0.0.5:5555" written that way used to reach
+		// adb with the quotes attached, so every poll failed and every tune sat
+		// out the full TUNE_TIMEOUT while the log blamed the port.
+		tunerIP:     envRaw("TUNER" + n + "_IP"),
+		encoderURL:  envRaw("ENCODER" + n + "_URL"),
 		minWait:     envDur("MIN_WAIT", 1*time.Second),
 		tuneTimeout: envDur("TUNE_TIMEOUT", 40*time.Second),
 		confirm:     envInt("CONFIRM", 1),
@@ -198,6 +207,7 @@ func loadConfig() (*config, error) {
 		riseFactor:    envFloat("RISE_FACTOR", 5.0),
 		motionHold:    envInt("MOTION_HOLD", 3),
 		motionWindow:  envDur("MOTION_WINDOW", 250*time.Millisecond),
+		rearmMotion:   envBool("REARM_MOTION", false),
 		drainIdle:     envDur("DRAIN_IDLE", 500*time.Microsecond),
 		readTimeout:   envDur("READ_TIMEOUT", 10*time.Second),
 		waitAudio:     envBool("WAIT_AUDIO", false),
@@ -220,15 +230,24 @@ func loadConfig() (*config, error) {
 
 var reID = regexp.MustCompile(`(?m)^\s*Id:\s*(\S+)`)
 
-// secureCodecID returns the client id of an allocated secure video decoder, or
-// "". Android hands out a new client per playback session, so a CHANGED id is
-// the signal -- "a decoder exists" is not, since the previous channel's decoder
-// may still be allocated when the gate starts.
-func secureCodecID(dump string) string {
+// secureCodecIDs returns the client ids of every allocated secure video decoder,
+// in the order the dump lists them. Android hands out a new client per playback
+// session, so an id we have not seen before is the signal -- "a decoder exists"
+// is not, since the previous channel's decoder may still be allocated when the
+// gate starts.
+//
+// A set rather than a single id on purpose. An in-place channel switch leaves
+// the previous decoder allocated alongside the new one, and picking one of them
+// means betting on the order the dump happens to use: pick the old id and the
+// gate never fires, pick a pre-existing one from a two-decoder baseline and the
+// gate fires immediately on the channel we are trying to leave. Comparing sets
+// is correct whatever the order.
+func secureCodecIDs(dump string) []string {
 	lines := strings.Split(dump, "\n")
 	inProc := false
 	id := ""
-	found := ""
+	var found []string
+	seen := map[string]bool{}
 	for _, line := range lines {
 		t := strings.TrimSpace(line)
 		if strings.HasPrefix(t, "Process Pid override") || strings.HasPrefix(t, "Events logs") {
@@ -247,15 +266,32 @@ func secureCodecID(dump string) string {
 		l := strings.ToLower(line)
 		if strings.Contains(l, "video-codec") || strings.Contains(l, "videocodec") {
 			if !strings.Contains(l, "non-secure") && strings.Contains(l, "secure") {
-				// Keep scanning. An in-place channel switch leaves the previous
-				// decoder allocated alongside the new one, and it is listed first,
-				// so returning the first match reports the OLD id and the "changed
-				// id" test never fires.
-				found = id
+				if id != "" && !seen[id] {
+					seen[id] = true
+					found = append(found, id)
+				}
 			}
 		}
 	}
 	return found
+}
+
+func setOf(ids []string) map[string]bool {
+	s := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		s[id] = true
+	}
+	return s
+}
+
+// newCodec returns the first id that was not present at baseline, or "".
+func newCodec(ids []string, base map[string]bool) string {
+	for _, id := range ids {
+		if !base[id] {
+			return id
+		}
+	}
+	return ""
 }
 
 // mediaSessionState reads the top media session. Fallback for devices where the
@@ -282,13 +318,25 @@ func mediaSessionState(dump string) string {
 	return "unknown"
 }
 
-func adbShell(ctx context.Context, ip, cmd string) string {
-	c, cancel := context.WithTimeout(ctx, 10*time.Second)
+// adbCallTimeout is the ceiling on a single adb invocation.
+const adbCallTimeout = 10 * time.Second
+
+// adbShell runs one adb command, bounded by whatever is left of the caller's
+// budget. Passing the remaining budget matters because TUNE_TIMEOUT is only
+// checked at the top of the poll loop: a flat 10s ceiling let a call started
+// just under the deadline run the loop ~12s past it.
+func adbShell(ctx context.Context, ip, cmd string, budget time.Duration) string {
+	if budget <= 0 {
+		return ""
+	}
+	if budget > adbCallTimeout {
+		budget = adbCallTimeout
+	}
+	c, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	// WaitDelay matters: without it Output() waits for EOF on pipes that the adb
 	// server daemon may have inherited, so it can block well past the context
-	// deadline -- and TUNE_TIMEOUT is only checked at the top of the poll loop,
-	// so nothing else would cut it short.
+	// deadline.
 	ec := exec.CommandContext(c, "adb", "-s", ip, "shell", cmd)
 	ec.WaitDelay = 2 * time.Second
 	out, err := ec.Output()
@@ -300,11 +348,18 @@ func adbShell(ctx context.Context, ip, cmd string) string {
 
 // waitForVideo blocks until a new secure decoder has been seen `confirm` times.
 func waitForVideo(ctx context.Context, c *config) error {
-	cc, ccCancel := context.WithTimeout(ctx, 10*time.Second)
-	connect := exec.CommandContext(cc, "adb", "connect", c.tunerIP)
-	connect.WaitDelay = 2 * time.Second
-	_ = connect.Run()
-	ccCancel()
+	start := time.Now()
+	deadline := start.Add(c.tuneTimeout)
+
+	connect := func() {
+		cc, ccCancel := context.WithTimeout(ctx, adbCallTimeout)
+		ec := exec.CommandContext(cc, "adb", "connect", c.tunerIP)
+		ec.WaitDelay = 2 * time.Second
+		_ = ec.Run()
+		ccCancel()
+	}
+	connect()
+	lastConnect := time.Now()
 
 	// One round trip per poll: the resource dump, a marker, then the top
 	// PlaybackState line.
@@ -316,20 +371,20 @@ func waitForVideo(ctx context.Context, c *config) error {
 		return out, ""
 	}
 
-	rm, ms := split(adbShell(ctx, c.tunerIP, probe))
-	base := secureCodecID(rm)
-	baseSession := mediaSessionState(ms)
-	// The session has no identity, so it only counts once it has dropped at
-	// least once since we started -- otherwise a session left parked at
-	// state=3 by the previous channel reads as instant success.
-	armed := baseSession != "playing"
-	if c.debug {
-		logf(c, "baseline codec=%s session=%s armed=%v", orNone(base), baseSession, armed)
-	}
+	// The baseline has to come from a probe that actually succeeded, so it is
+	// taken by the first good poll rather than by one unchecked call up front.
+	// The call immediately after `adb connect` is the one most likely to fail,
+	// and an empty baseline makes EVERY decoder look new -- so the previous
+	// channel's still-allocated codec opened the gate on the first poll, with
+	// the old channel still on screen. Same for the session: an empty dump reads
+	// as "not playing", which armed the fallback instantly.
+	haveBase := false
+	var baseIDs []string
+	var baseSet map[string]bool
+	armed := false
 
-	start := time.Now()
 	hits := 0
-	adbFailures, polls := 0, 0
+	adbFailures, polls, consecFailures := 0, 0, 0
 	for {
 		elapsed := time.Since(start)
 		if elapsed >= c.tuneTimeout {
@@ -339,27 +394,58 @@ func waitForVideo(ctx context.Context, c *config) error {
 				return fmt.Errorf("no playback after %ds -- every adb call to %s failed or returned nothing (is adb reachable? does TUNER%s_IP include :5555?)",
 					int(elapsed.Seconds()), c.tunerIP, c.tuner)
 			}
+			if !haveBase {
+				return fmt.Errorf("no playback after %ds (adb ok on %d/%d polls) -- never got a usable baseline from %s",
+					int(elapsed.Seconds()), polls-adbFailures, polls, c.tunerIP)
+			}
 			return fmt.Errorf("no playback after %ds (adb ok on %d/%d polls, base=%s) -- device reported no secure decoder and no playing media session",
-				int(elapsed.Seconds()), polls-adbFailures, polls, orNone(base))
+				int(elapsed.Seconds()), polls-adbFailures, polls, orNone(strings.Join(baseIDs, ",")))
 		}
 		polls++
 
-		raw := adbShell(ctx, c.tunerIP, probe)
+		raw := adbShell(ctx, c.tunerIP, probe, time.Until(deadline))
 		if raw == "" {
 			adbFailures++
+			consecFailures++
+			// These sessions drop -- the box sleeps, the network blips, adb decides
+			// the device is offline. Without this a drop meant every remaining poll
+			// failed and the tune sat out the full TUNE_TIMEOUT. Rate limited so ten
+			// tuners cannot flood one adb server with reconnects.
+			if consecFailures >= 3 && time.Since(lastConnect) > 5*time.Second {
+				lastConnect = time.Now()
+				connect()
+			}
+			time.Sleep(c.poll)
+			continue
 		}
+		consecFailures = 0
 		rm, ms := split(raw)
-		id := secureCodecID(rm)
+		ids := secureCodecIDs(rm)
 		session := mediaSessionState(ms)
 
-		// A decoder that is not the one we started with is proof of new playback
-		// and needs no arming, because it carries its own identity. The session
-		// does not, so it only counts once armed.
+		if !haveBase {
+			haveBase = true
+			baseIDs, baseSet = ids, setOf(ids)
+			// The session has no identity, so it only counts once it has dropped at
+			// least once since we started -- otherwise a session left parked at
+			// state=3 by the previous channel reads as instant success.
+			armed = session != "playing"
+			if c.debug {
+				logf(c, "baseline codec=%s session=%s armed=%v (poll %d)",
+					orNone(strings.Join(baseIDs, ",")), session, armed, polls)
+			}
+			time.Sleep(c.poll)
+			continue
+		}
+
+		// A decoder we did not start with is proof of new playback and needs no
+		// arming, because it carries its own identity. The session does not, so it
+		// only counts once armed.
 		via := ""
 		playing := false
 		switch {
-		case id != "" && id != base:
-			playing, via = true, "codec "+id
+		case newCodec(ids, baseSet) != "":
+			playing, via = true, "codec "+newCodec(ids, baseSet)
 		case session == "playing" && armed:
 			playing, via = true, "session playing"
 		}
@@ -369,7 +455,8 @@ func waitForVideo(ctx context.Context, c *config) error {
 
 		if c.debug {
 			logf(c, "t=%.1fs codec=%s base=%s session=%s armed=%v hits=%d playing=%v",
-				elapsed.Seconds(), orNone(id), orNone(base), session, armed, hits, playing)
+				elapsed.Seconds(), orNone(strings.Join(ids, ",")),
+				orNone(strings.Join(baseIDs, ",")), session, armed, hits, playing)
 		}
 
 		if playing && elapsed >= c.minWait {
@@ -379,7 +466,7 @@ func waitForVideo(ctx context.Context, c *config) error {
 					time.Sleep(c.settle)
 				}
 				logf(c, "playback detected after %ds via %s (base %s), %d confirmation(s)",
-					int(time.Since(start).Seconds()), via, orNone(base), hits)
+					int(time.Since(start).Seconds()), via, orNone(strings.Join(baseIDs, ",")), hits)
 				return nil
 			}
 			time.Sleep(c.confirmPoll)
@@ -412,8 +499,8 @@ func orNone(s string) string {
 // had finished. Once the output is keyframe-aligned that slack disappears and
 // the pre-render frames become visible, which shows up as a blue/black flash at
 // the head of the recording.
-func audioStarted(ctx context.Context, c *config) bool {
-	dump := adbShell(ctx, c.tunerIP, "dumpsys audio")
+func audioStarted(ctx context.Context, c *config, budget time.Duration) bool {
+	dump := adbShell(ctx, c.tunerIP, "dumpsys audio", budget)
 	if dump == "" {
 		return false
 	}
@@ -441,8 +528,9 @@ func waitForRender(ctx context.Context, c *config) {
 		return
 	}
 	start := time.Now()
+	deadline := start.Add(c.renderTimeout)
 	for time.Since(start) < c.renderTimeout {
-		if audioStarted(ctx, c) {
+		if audioStarted(ctx, c, time.Until(deadline)) {
 			logf(c, "render confirmed after a further %dms (audio playback started)",
 				time.Since(start).Milliseconds())
 			return
@@ -624,7 +712,6 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 	// So batch only what has ALREADY arrived and flush as soon as nothing more is
 	// immediately readable. Latency is identical to writing per packet -- nothing
 	// is ever held waiting for more data -- at a fraction of the syscalls.
-	out := os.Stdout
 	// 8 packets, not 64. The batch normally flushes the moment the reader runs
 	// dry, so it rarely fills -- but the cap is the worst-case hold time, and at
 	// 64 packets that ceiling was ~28ms of video sitting in memory. At 8 it is
@@ -634,7 +721,7 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 		if len(batch) == 0 {
 			return nil
 		}
-		n, err := out.Write(batch)
+		n, err := stdoutW.Write(batch)
 		sent += n
 		batch = batch[:0]
 		return err
@@ -671,6 +758,18 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 				if !c.alignKey {
 					aligned = true
 				}
+				// Opt-in. Everything measured before the gate came off a DIFFERENT
+				// picture -- usually the channel we are leaving -- so a rise seen
+				// back there can latch motionSeen and wave the new channel's loading
+				// card straight through. Re-learning from the gate closes that, but
+				// it is off by default because a switch that never shows a card (a
+				// retune to what is already playing) then has no rise to find and
+				// pays the whole MOTION_TIMEOUT.
+				if c.rearmMotion {
+					motionSeen, motionStreak = false, 0
+					floorRate = -1
+					winBytes, winStart = 0, gateAt
+				}
 			default:
 			}
 		}
@@ -699,7 +798,12 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 			readStart = time.Now()
 		}
 		if err := readPacket(br, pkt); err != nil {
-			flush()
+			// Report a failed final flush instead of the read error. If the DVR hung
+			// up, that is the real reason we are here and main treats it as the
+			// normal end of a recording; blaming the encoder logged a false failure.
+			if ferr := flush(); ferr != nil {
+				return ferr
+			}
 			// An encoder with no input can answer 200 with an empty body. Treating
 			// that as a clean EOF exited 0 having sent the DVR nothing at all.
 			if !wrote {
@@ -773,37 +877,46 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 		// and quality settings. The stream calibrates itself -- remember the
 		// quietest window seen, and call it motion when a window rises well above
 		// that floor and HOLDS, since the cut itself produces brief spikes.
-		// Exclude null padding. A constant-bitrate encoder pads with PID 0x1FFF to
-		// hold the mux rate steady, so counting every packet measures the mux rate
-		// rather than the picture and motion can never be detected.
-		if p != 0x1fff {
-			winBytes += tsPacketSize
-		}
-		if now := time.Now(); now.Sub(winStart) >= c.motionWindow {
-			elapsed := now.Sub(winStart)
-			// Drop windows that ran long. If the stream stalls -- an HDMI resync on
-			// wake is enough -- the window still closes and measures a near-zero
-			// rate, which latches the floor permanently low and makes every later
-			// window look like motion.
-			if elapsed > 2*c.motionWindow {
-				winBytes, winStart = 0, now
-				continue
+		//
+		// Only until we align: nothing below reads any of it afterwards, and
+		// keeping it off the post-alignment path is what makes it impossible for
+		// the long-window reset to drop a packet out of the stream.
+		if !aligned {
+			// Exclude null padding. A constant-bitrate encoder pads with PID 0x1FFF
+			// to hold the mux rate steady, so counting every packet measures the mux
+			// rate rather than the picture and motion can never be detected.
+			if p != 0x1fff {
+				winBytes += tsPacketSize
 			}
-			rate := float64(winBytes) / elapsed.Seconds()
-			if floorRate < 0 || rate < floorRate {
-				floorRate = rate
-			}
-			if floorRate > 0 && rate > floorRate*c.riseFactor {
-				motionStreak++
-				if !motionSeen && motionStreak >= c.motionHold {
-					motionSeen = true
-					motionAt = now
-					motionRate, motionFloor = rate, floorRate
+			if now := time.Now(); now.Sub(winStart) >= c.motionWindow {
+				elapsed := now.Sub(winStart)
+				// Ignore windows that ran long. If the stream stalls -- an HDMI resync
+				// on wake is enough -- the window still closes and measures a near-zero
+				// rate, which latches the floor permanently low and makes every later
+				// window look like motion.
+				//
+				// Reset and fall through; do NOT skip the rest of the loop. Continuing
+				// here used to drop this packet -- before alignment that cost a whole
+				// GOP by skipping a keyframe, and after it the packet was simply gone
+				// from the output, which is a continuity break in the recording.
+				if elapsed <= 2*c.motionWindow {
+					rate := float64(winBytes) / elapsed.Seconds()
+					if floorRate < 0 || rate < floorRate {
+						floorRate = rate
+					}
+					if floorRate > 0 && rate > floorRate*c.riseFactor {
+						motionStreak++
+						if !motionSeen && motionStreak >= c.motionHold {
+							motionSeen = true
+							motionAt = now
+							motionRate, motionFloor = rate, floorRate
+						}
+					} else {
+						motionStreak = 0
+					}
 				}
-			} else {
-				motionStreak = 0
+				winBytes, winStart = 0, now
 			}
-			winBytes, winStart = 0, now
 		}
 
 		if !open {

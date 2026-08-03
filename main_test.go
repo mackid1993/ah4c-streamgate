@@ -1,6 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 	"time"
@@ -15,7 +19,7 @@ func TestEnvDur(t *testing.T) {
 		{"", def},
 		{"5", 5 * time.Second},
 		{"0.25", 250 * time.Millisecond},
-		{"10s", 10 * time.Second},        // Go duration syntax
+		{"10s", 10 * time.Second},         // Go duration syntax
 		{"250ms", 250 * time.Millisecond}, // Go duration syntax
 		{" 5 ", 5 * time.Second},          // whitespace from env files
 		{`"5"`, 5 * time.Second},          // quotes survive docker --env-file
@@ -68,6 +72,27 @@ func TestOnTimeoutFailSafe(t *testing.T) {
 		}
 	}
 	os.Unsetenv("ON_TIMEOUT")
+	os.Unsetenv("ENCODER9_URL")
+}
+
+// docker --env-file keeps the quotes. A quoted IP reached adb verbatim, so every
+// poll failed and the tune sat out the whole TUNE_TIMEOUT blaming the port.
+func TestAddressesAreUnquoted(t *testing.T) {
+	os.Setenv("TUNER9_IP", `"192.168.1.5:5555"`)
+	os.Setenv("ENCODER9_URL", " http://10.0.0.9/0.ts ")
+	os.Args = []string{"streamgate", "9"}
+	c, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.tunerIP != "192.168.1.5:5555" {
+		t.Errorf("tunerIP = %q, want the quotes stripped", c.tunerIP)
+	}
+	if c.encoderURL != "http://10.0.0.9/0.ts" {
+		t.Errorf("encoderURL = %q, want it trimmed", c.encoderURL)
+	}
+	os.Unsetenv("TUNER9_IP")
+	os.Unsetenv("ENCODER9_URL")
 }
 
 // MOTION_TIMEOUT must expire before the alignment fallback, otherwise raising it
@@ -86,12 +111,15 @@ func TestTimeoutOrdering(t *testing.T) {
 	}
 	os.Unsetenv("MOTION_TIMEOUT")
 	os.Unsetenv("ALIGN_TIMEOUT")
+	os.Unsetenv("ENCODER9_URL")
 }
 
+// ---------------------------------------------------------------- detection
+
 // An in-place channel switch leaves the previous decoder allocated alongside the
-// new one, listed first. Returning the first match reported the OLD id, so the
-// "changed id" test never fired and the tune timed out.
-func TestSecureCodecIDPrefersNewest(t *testing.T) {
+// new one. Reporting a single id meant betting on the order the dump lists them;
+// both must come back so the caller can compare sets.
+func TestSecureCodecIDsReturnsAll(t *testing.T) {
 	dump := `
   Processes:
     Pid: 1000
@@ -101,33 +129,65 @@ func TestSecureCodecIDPrefersNewest(t *testing.T) {
       Id: NEWCODEC
       {name: secure-codec, subType: video-codec, value: 1}
 `
-	if got := secureCodecID(dump); got != "NEWCODEC" {
-		t.Errorf("secureCodecID = %q, want NEWCODEC", got)
+	got := secureCodecIDs(dump)
+	if len(got) != 2 || got[0] != "OLDCODEC" || got[1] != "NEWCODEC" {
+		t.Fatalf("secureCodecIDs = %v, want [OLDCODEC NEWCODEC]", got)
+	}
+	base := setOf([]string{"OLDCODEC"})
+	if id := newCodec(got, base); id != "NEWCODEC" {
+		t.Errorf("newCodec = %q, want NEWCODEC", id)
+	}
+	// Whatever order the device lists them in, the answer is the same.
+	if id := newCodec([]string{"NEWCODEC", "OLDCODEC"}, base); id != "NEWCODEC" {
+		t.Errorf("newCodec (reversed) = %q, want NEWCODEC", id)
+	}
+	// Two decoders already allocated at baseline must not read as new.
+	if id := newCodec(got, setOf(got)); id != "" {
+		t.Errorf("newCodec against its own baseline = %q, want empty", id)
 	}
 }
 
-func TestSecureCodecIDRealFormat(t *testing.T) {
+func TestSecureCodecIDsRealFormat(t *testing.T) {
 	dump := `
   Processes:
     Pid: 4529
       Id: 1284494944
       {name: secure-codec, subType: video-codec, value: 1}
 `
-	if got := secureCodecID(dump); got != "1284494944" {
-		t.Errorf("secureCodecID = %q, want 1284494944", got)
+	got := secureCodecIDs(dump)
+	if len(got) != 1 || got[0] != "1284494944" {
+		t.Errorf("secureCodecIDs = %v, want [1284494944]", got)
 	}
 }
 
 // A non-DRM app allocates a NON-secure decoder; it must not be mistaken for one.
-func TestSecureCodecIDIgnoresNonSecure(t *testing.T) {
+func TestSecureCodecIDsIgnoresNonSecure(t *testing.T) {
 	dump := `
   Processes:
     Pid: 1000
       Id: PLAIN
       {name: non-secure-codec, subType: video-codec, value: 1}
 `
-	if got := secureCodecID(dump); got != "" {
-		t.Errorf("secureCodecID = %q, want empty for a non-secure decoder", got)
+	if got := secureCodecIDs(dump); len(got) != 0 {
+		t.Errorf("secureCodecIDs = %v, want none for a non-secure decoder", got)
+	}
+}
+
+// History must not be mined for decoders that are no longer allocated.
+func TestSecureCodecIDsStopsAtEventsLog(t *testing.T) {
+	dump := `
+  Processes:
+    Pid: 1000
+      Id: LIVE
+      {name: secure-codec, subType: video-codec, value: 1}
+  Events logs:
+    Pid: 9999
+      Id: HISTORICAL
+      {name: secure-codec, subType: video-codec, value: 1}
+`
+	got := secureCodecIDs(dump)
+	if len(got) != 1 || got[0] != "LIVE" {
+		t.Errorf("secureCodecIDs = %v, want [LIVE]", got)
 	}
 }
 
@@ -146,6 +206,8 @@ func TestMediaSessionState(t *testing.T) {
 	}
 }
 
+// ------------------------------------------------------------ TS inspection
+
 // A malformed stream must never panic: a panic in the stream goroutine kills a
 // live recording.
 func TestParsersDoNotPanic(t *testing.T) {
@@ -163,5 +225,232 @@ func TestParsersDoNotPanic(t *testing.T) {
 			_ = pmtPIDs(pl)
 			_ = videoPIDs(pl)
 		}
+	}
+}
+
+// ------------------------------------------------------------------ streaming
+
+const (
+	testPMTPid   uint16 = 0x1000
+	testVideoPid uint16 = 0x0100
+)
+
+// Split out because byte(testPMTPid) is a constant conversion and 0x1000 does
+// not fit in a byte.
+const (
+	pmtHi, pmtLo = byte(testPMTPid >> 8), byte(testPMTPid & 0xff)
+	vidHi, vidLo = byte(testVideoPid >> 8), byte(testVideoPid & 0xff)
+)
+
+func fill(pkt []byte, from int, seq byte) {
+	for i := from; i < tsPacketSize; i++ {
+		pkt[i] = seq
+	}
+}
+
+func patPacket(cc byte) []byte {
+	p := make([]byte, tsPacketSize)
+	p[0] = 0x47
+	p[1] = 0x40 // payload_unit_start, pid 0
+	p[2] = 0x00
+	p[3] = 0x10 | cc // payload only
+	p[4] = 0x00      // pointer_field
+	s := p[5:]
+	s[0] = 0x00 // table_id
+	s[1] = 0xb0
+	s[2] = 0x0d // section_length 13
+	s[3], s[4] = 0x00, 0x01
+	s[5], s[6], s[7] = 0xc1, 0x00, 0x00
+	s[8], s[9] = 0x00, 0x01          // program_number 1
+	s[10], s[11] = 0xe0|pmtHi, pmtLo // PMT pid
+	return p
+}
+
+func pmtPacket(cc byte) []byte {
+	p := make([]byte, tsPacketSize)
+	p[0] = 0x47
+	p[1] = 0x40 | pmtHi
+	p[2] = pmtLo
+	p[3] = 0x10 | cc
+	p[4] = 0x00
+	s := p[5:]
+	s[0] = 0x02 // table_id
+	s[1] = 0xb0
+	s[2] = 0x12 // section_length 18
+	s[3], s[4] = 0x00, 0x01
+	s[5], s[6], s[7] = 0xc1, 0x00, 0x00
+	s[8], s[9] = 0xe0|vidHi, vidLo   // PCR pid
+	s[10], s[11] = 0xf0, 0x00        // program_info_length 0
+	s[12] = 0x1b                     // H.264
+	s[13], s[14] = 0xe0|vidHi, vidLo // elementary pid
+	s[15], s[16] = 0xf0, 0x00        // ES_info_length 0
+	return p
+}
+
+func videoPacket(cc byte, key bool, seq byte) []byte {
+	p := make([]byte, tsPacketSize)
+	p[0] = 0x47
+	p[1] = 0x40 | vidHi
+	p[2] = vidLo
+	if key {
+		p[3] = 0x30 | cc // adaptation field + payload
+		p[4] = 0x01      // adaptation_field_length
+		p[5] = 0x40      // random_access_indicator
+		fill(p, 6, seq)
+		return p
+	}
+	p[3] = 0x10 | cc
+	fill(p, 4, seq)
+	return p
+}
+
+// buildStream returns a TS stream: tables, then video with a keyframe every
+// `keyEvery` packets. Every packet body is unique, so a run of output can be
+// located unambiguously in the input.
+func buildStream(nVideo, keyEvery int) []byte {
+	var b []byte
+	b = append(b, patPacket(0)...)
+	b = append(b, pmtPacket(0)...)
+	for i := 0; i < nVideo; i++ {
+		b = append(b, videoPacket(byte(i&0x0f), i > 0 && i%keyEvery == 0, byte(i+1))...)
+	}
+	return b
+}
+
+// serveTS writes the stream one packet at a time with a pause between each, so
+// reads come off the network rather than out of a buffer.
+func serveTS(t *testing.T, data []byte, gap time.Duration) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp2t")
+		w.WriteHeader(http.StatusOK)
+		fl, _ := w.(http.Flusher)
+		for i := 0; i+tsPacketSize <= len(data); i += tsPacketSize {
+			if _, err := w.Write(data[i : i+tsPacketSize]); err != nil {
+				return
+			}
+			if fl != nil {
+				fl.Flush()
+			}
+			time.Sleep(gap)
+		}
+	}))
+}
+
+func testConfig(url string) *config {
+	return &config{
+		tuner:         "T",
+		encoderURL:    url,
+		alignKey:      true,
+		alignTimeout:  5 * time.Second,
+		waitMotion:    false,
+		motionTimeout: time.Second,
+		riseFactor:    5,
+		motionHold:    3,
+		// Deliberately tiny relative to the packet spacing below, so every
+		// measurement window closes "long". That is the condition under which the
+		// window reset used to skip the rest of the loop and drop the packet.
+		motionWindow: time.Millisecond,
+		drainIdle:    0, // the test server is not bursting; nothing to catch up on
+		readTimeout:  2 * time.Second,
+	}
+}
+
+// runStream captures what stream() writes to stdout.
+func runStream(t *testing.T, c *config, gate <-chan struct{}) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	saved := stdoutW
+	stdoutW = &buf
+	defer func() { stdoutW = saved }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	// The stream always ends in an error -- the encoder stops sending. What
+	// matters is what reached stdout before that.
+	_ = stream(ctx, c, gate)
+	return buf.Bytes()
+}
+
+// checkContiguous asserts the README's actual promise: after the injected
+// tables, the output is an unbroken run of the input that starts on a keyframe
+// and continues to the end. A single dropped packet fails this.
+func checkContiguous(t *testing.T, input, out []byte, wantSkipped bool) {
+	t.Helper()
+	if len(out) < 3*tsPacketSize {
+		t.Fatalf("output is %d bytes, want tables plus video", len(out))
+	}
+	if got := pid(out[0:tsPacketSize]); got != 0 {
+		t.Errorf("first packet pid = %d, want the cached PAT (0)", got)
+	}
+	if got := pid(out[tsPacketSize : 2*tsPacketSize]); got != testPMTPid {
+		t.Errorf("second packet pid = %d, want the cached PMT (%d)", got, testPMTPid)
+	}
+	rest := out[2*tsPacketSize:]
+	if !randomAccess(rest[:tsPacketSize]) {
+		t.Error("stream did not start on a keyframe")
+	}
+	idx := bytes.Index(input, rest)
+	if idx < 0 {
+		t.Fatal("output is not a contiguous run of the input -- a packet was dropped or reordered")
+	}
+	if idx%tsPacketSize != 0 {
+		t.Fatalf("output starts %d bytes into a packet, want packet alignment", idx%tsPacketSize)
+	}
+	if idx+len(rest) != len(input) {
+		t.Fatalf("output ends %d bytes early -- packets were dropped near the end",
+			len(input)-(idx+len(rest)))
+	}
+	if wantSkipped && idx == 0 {
+		t.Error("expected the pre-gate packets to be skipped, but the output starts at packet 0")
+	}
+}
+
+// The gate is already open, so the only thing between input and output is
+// keyframe alignment.
+func TestStreamOutputIsContiguous(t *testing.T) {
+	input := buildStream(60, 10)
+	srv := serveTS(t, input, 3*time.Millisecond)
+	defer srv.Close()
+
+	gate := make(chan struct{})
+	close(gate)
+	checkContiguous(t, input, runStream(t, testConfig(srv.URL), gate), false)
+}
+
+// Nothing received before the gate opens may ever be emitted, and what is
+// emitted still has to be unbroken.
+func TestStreamEmitsNothingBeforeTheGate(t *testing.T) {
+	input := buildStream(120, 10)
+	srv := serveTS(t, input, 3*time.Millisecond)
+	defer srv.Close()
+
+	gate := make(chan struct{})
+	go func() {
+		time.Sleep(120 * time.Millisecond)
+		close(gate)
+	}()
+	checkContiguous(t, input, runStream(t, testConfig(srv.URL), gate), true)
+}
+
+// With ALIGN_KEYFRAME off there is no alignment and no injected tables, but the
+// output must still be an unbroken run from wherever the gate opened.
+func TestStreamUnalignedIsContiguous(t *testing.T) {
+	input := buildStream(60, 10)
+	srv := serveTS(t, input, 3*time.Millisecond)
+	defer srv.Close()
+
+	c := testConfig(srv.URL)
+	c.alignKey = false
+	gate := make(chan struct{})
+	close(gate)
+
+	out := runStream(t, c, gate)
+	if len(out) < tsPacketSize {
+		t.Fatalf("output is %d bytes, want video", len(out))
+	}
+	idx := bytes.Index(input, out)
+	if idx < 0 || idx%tsPacketSize != 0 || idx+len(out) != len(input) {
+		t.Fatal("unaligned output is not a contiguous run of the input")
 	}
 }

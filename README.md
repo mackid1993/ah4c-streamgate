@@ -16,7 +16,7 @@ Download a binary from [Releases](../../releases) — `linux-amd64`, `linux-arm6
 
 ```sh
 curl -fsSL -o /path/to/ah4c/scripts/streamgate \
-  https://github.com/mackid1993/ah4c-streamgate/releases/latest/download/streamgate-linux-amd64
+  https://github.com/mackid1993/ah4c-streamgatego/releases/latest/download/streamgate-linux-amd64
 chmod +x /path/to/ah4c/scripts/streamgate
 ```
 
@@ -52,15 +52,17 @@ Two details worth knowing:
 
 Two signals, cheapest first, both from a single adb round trip per poll.
 
-**1. A new secure video decoder.** `dumpsys media.resource_manager` lists which processes hold a video codec. Android issues a new client id per playback session, so streamgate notes the id before tuning and waits for a **different** one.
+**1. A new secure video decoder.** `dumpsys media.resource_manager` lists which processes hold a video codec. Android issues a new client id per playback session, so streamgate records the **set** of ids before tuning and waits for one that wasn't in it.
 
-That distinction matters more than it looks. Asking whether a decoder merely *exists* returns true immediately, because the previous channel's decoder is often still allocated when the gate starts — an in-place channel switch tears nothing down.
+That distinction matters more than it looks. Asking whether a decoder merely *exists* returns true immediately, because the previous channel's decoder is often still allocated when the gate starts — an in-place channel switch tears nothing down. Comparing sets rather than picking one id also means it doesn't matter what order the device lists them in, which varies.
 
 **2. The media session.** `dumpsys media_session` reporting `state=3` with `speed=1`. Used when the first signal isn't available — older Android, or vendor builds that report codecs differently.
 
 This one has no identity, so it only counts once it has dropped at least once since the gate started. A channel that just ended can leave its session parked at exactly `state=3`, and without that rule it would read as instant success.
 
 Whichever fires must hold for `CONFIRM` consecutive polls.
+
+Both rest on the baseline being real, so the baseline is taken by the first poll that actually comes back — not by one unchecked call at startup. An empty dump makes every decoder look new and reads as "not playing", so a single failed probe (and the call right after `adb connect` is the likeliest one to fail) would otherwise open the gate immediately on the channel you're leaving. If the adb session drops mid-wait, streamgate reconnects rather than spending the rest of `TUNE_TIMEOUT` failing.
 
 ---
 
@@ -122,6 +124,8 @@ optimisation:
   programming was already running before we connected.
 - No keyframe within `ALIGN_TIMEOUT` + 2s — stream unaligned rather than produce no output at all. The cached PAT/PMT are still sent first, so the DVR does not additionally wait for the encoder's next table cycle.
 
+One thing the floor cannot tell you: everything measured *before* the gate came off a different picture, usually the channel you're leaving. If that channel was already playing, motion may register on it and wave the new channel's loading card straight through. `REARM_MOTION=1` throws that away and re-learns from the gate. It's off by default because a switch that never shows a card — a retune to what's already playing — then has no rise to find and pays the whole `MOTION_TIMEOUT`. Turn it on if you see the card and leave it off otherwise.
+
 ## Settings
 
 All optional, all environment variables, set on the **ah4c container** (streamgate inherits its environment). Durations accept either seconds (`5`, `0.25`) or Go syntax (`10s`, `250ms`). A value that can't be parsed is ignored with a warning on stderr rather than silently falling back.
@@ -143,7 +147,7 @@ The defaults are tuned; most people should never touch these.
 | `MIN_WAIT` | `1` | Ignore "playing" for this many seconds after start. |
 | `TUNE_TIMEOUT` | `40` | Give up after this long. Costs nothing on a tune that works — the wait ends the moment playback is detected. |
 | `ON_TIMEOUT` | `fail` | `fail` exits without streaming, so your DVR sees a dead tune and can retry or pick another tuner. Anything else streams whatever is on screen. |
-| `ALIGN_KEYFRAME` | `1` | Start output on a keyframe. `0` streams from wherever the encoder happens to be. |
+| `ALIGN_KEYFRAME` | `1` | Start output on a keyframe. `0` streams from wherever the encoder happens to be — and because the motion gate runs while waiting to align, `0` turns `WAIT_MOTION` off too. |
 | `ALIGN_TIMEOUT` | `8` | If no keyframe is recognised within this long, stream unaligned rather than stall. Automatically raised above `MOTION_TIMEOUT` if you set them so they'd conflict. |
 | `WAIT_AUDIO` | `0` | After the decoder appears, also wait for audio playback to start. Costs ~0.7s. Only needed if a flash survives `SETTLE`. |
 | `RENDER_TIMEOUT` | `3` | Cap on that wait, so a device that never reports audio still tunes. |
@@ -153,6 +157,7 @@ The defaults are tuned; most people should never touch these.
 | `MOTION_HOLD` | `3` | Consecutive windows above the threshold before it counts as motion. Filters out brief spikes from the cut itself. |
 | `RISE_FACTOR` | `5` | How far above the quietest observed window a window must rise. A ratio, not a bitrate. |
 | `MOTION_TIMEOUT` | `6` | Give up waiting for motion after this long and release anyway. |
+| `REARM_MOTION` | `0` | Discard what the motion detector learned before the gate and re-learn from it. Closes the case where the previous channel's motion releases the new channel's loading card, at the cost of `MOTION_TIMEOUT` on switches that never show a card. |
 | `DEBUG` | unset | Log every poll. |
 
 ### If a recording starts on the app's tuning screen
@@ -173,7 +178,7 @@ Every tune logs one detection line and one alignment line:
 
 ```
 streamgate[1]: playback detected after 5s via codec 1284494944 (base none), 1 confirmation(s)
-streamgate[1]: aligned video-pid=100 discarded=159 packets/29KB gate-to-air=0.21s                waited-for-motion=180ms picture=2903kbps still-picture-floor=342kbps ratio=8.5x keyframes-skipped=0
+streamgate[1]: aligned video-pid=100 discarded=159 packets/29KB caught-up=0KB gate-to-air=0.21s waited-for-motion=180ms picture=2903kbps still-picture-floor=342kbps ratio=8.5x keyframes-skipped=0
 ```
 
 What each number means:
@@ -184,6 +189,7 @@ What each number means:
 | `via codec … (base …)` | which signal fired. `base` is what was allocated before tuning — a *changed* id is the proof of new playback. |
 | `video-pid` | the PID carrying the keyframe the stream started on. |
 | `discarded` | bytes dropped between the gate opening and that keyframe. These would have been undecodable to your DVR anyway. |
+| `caught-up` | bytes thrown away by `DRAIN_IDLE` to get back to live. Usually `0KB` — streamgate reads the encoder continuously while it waits, so there is rarely a backlog to clear. |
 | `gate-to-air` | **the number to watch.** Total time from the gate opening to the first byte sent. |
 | `waited-for-motion` | how much of `gate-to-air` was spent waiting for the picture to start moving. Small means the tune cost nothing extra; a second or more means it genuinely held through a loading screen. |
 | `picture` / `still-picture-floor` | current data rate versus the quietest the stream has been. The floor is the app's loading screen; the ratio between them is what triggers release. |
@@ -198,9 +204,9 @@ what separates those cases, not the mere fact that it tripped.
 When the gate can't confirm anything:
 
 ```
-streamgate[1]: aligned video-pid=100 discarded=412 packets/76KB gate-to-air=6.05s                waited-for-motion=6s(timeout, released anyway) keyframes-skipped=2
-streamgate[1]: no keyframe at all within 10s; streaming unaligned
-streamgate[1]: no playback after 40s (base=none)
+streamgate[1]: aligned video-pid=100 discarded=412 packets/76KB caught-up=0KB gate-to-air=6.05s waited-for-motion=6s(timeout, released anyway) keyframes-skipped=2
+streamgate[1]: no keyframe recognised within 10s; streaming unaligned (encoder may not signal random access -- try ALIGN_KEYFRAME=0)
+streamgate[1]: no playback after 40s (adb ok on 158/160 polls, base=none) -- device reported no secure decoder and no playing media session
 ```
 
 `DEBUG=1` adds a line per poll showing both detection signals and the arming state.
