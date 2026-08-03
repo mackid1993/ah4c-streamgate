@@ -153,11 +153,12 @@ The defaults are tuned; most people should never touch these.
 | `RENDER_TIMEOUT` | `3` | Cap on that wait, so a device that never reports audio still tunes. |
 | `WAIT_MOTION` | `1` | Wait for the picture to start moving before releasing. `0` releases on the first keyframe. |
 | `MOTION_WINDOW` | `0.25` | Seconds per measurement window. |
-| `DRAIN_IDLE` | `500us` | At handoff, discard video the encoder sent while we were still waiting on the box, so playback starts from live rather than from whatever had queued up. A read faster than this came from a buffer, not the network. `0` disables it. |
+| `DRAIN_IDLE` | `500us` | At handoff, discard video the encoder sent while we were still waiting on the box, so playback starts from live rather than from whatever had queued up. A read faster than this came from a buffer, not the network. `0` disables it. **Note the unit:** this is the only setting here measured in microseconds, and a bare number is read as seconds — `DRAIN_IDLE=1` means one second, which would discard the head of every recording. Catching up is also capped at 2s regardless. |
 | `MOTION_HOLD` | `3` | Consecutive windows above the threshold before it counts as motion. Filters out brief spikes from the cut itself. |
 | `RISE_FACTOR` | `5` | How far above the quietest observed window a window must rise. A ratio, not a bitrate. |
 | `MOTION_TIMEOUT` | `6` | Give up waiting for motion after this long and release anyway. |
 | `REARM_MOTION` | `0` | Discard what the motion detector learned before the gate and re-learn from it. Closes the case where the previous channel's motion releases the new channel's loading card, at the cost of `MOTION_TIMEOUT` on switches that never show a card. |
+| `READ_TIMEOUT` | `10` | Give up if the encoder holds the connection open but sends nothing for this long. Catches a lost HDMI input or a wedged encode thread, which TCP keepalive does not — the peer is still answering. Every successful read pushes it out, so it only fires on genuine silence. |
 | `DEBUG` | unset | Log every poll. |
 
 ### If a recording starts on the app's tuning screen
@@ -192,7 +193,7 @@ What each number means:
 | `caught-up` | bytes thrown away by `DRAIN_IDLE` to get back to live. Normally a KB or two — streamgate reads the encoder continuously while it waits, so there is rarely much of a backlog to clear. A large number here means your encoder buffers, and `DRAIN_IDLE` is earning its keep. |
 | `gate-to-air` | **the number to watch.** Total time from the gate opening to the first byte sent. |
 | `waited-for-motion` | how much of `gate-to-air` was spent waiting for the picture to start moving. Small means the tune cost nothing extra; a second or more means it genuinely held through a loading screen. |
-| `picture` / `still-picture-floor` | current data rate versus the quietest the stream has been. The floor is the app's loading screen; the ratio between them is what triggers release. |
+| `picture` / `still-picture-floor` | current data rate versus the quietest the stream has been. The floor is normally the app's loading screen. Windows that carry almost nothing are ignored, so a gap in the encoder's output cannot masquerade as a very quiet picture and make the card itself look like motion. |
 | `ratio` | how many times above the floor. Release needs `RISE_FACTOR` (default 5×) sustained for `MOTION_HOLD` windows. |
 | `keyframes-skipped` | keyframes passed over while waiting. Non-zero means the loading screen outlived a full GOP. |
 

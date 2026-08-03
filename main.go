@@ -49,6 +49,16 @@ const (
 	maxDrain = 20000 // ~3.7MB, a stop so a bursting encoder cannot spin
 
 	tsPacketSize = 188
+	// Below this a measurement window is a gap in the stream, not a picture.
+	// 8 packets in a 250ms window is 48 kbit/s -- far under any real still frame,
+	// far over the one or two packets a stall leaves behind.
+	minWindowPackets = 8
+	// However DRAIN_IDLE is set, catching up is a handoff cost, not a phase of
+	// the recording. Without this a DRAIN_IDLE larger than the socket read
+	// interval makes every read look buffered, and the drain runs to maxDrain --
+	// 20000 packets. A user writing DRAIN_IDLE=1 gets one second, not one
+	// microsecond, and loses the whole recording to "encoder sent no video".
+	maxDrainTime = 2 * time.Second
 	// After ALIGN_TIMEOUT we stop insisting on motion and take any keyframe;
 	// this is the extra grace before giving up on alignment entirely.
 	relaxWindow = 2 * time.Second
@@ -460,6 +470,7 @@ func waitForVideo(ctx context.Context, c *config) error {
 
 	hits := 0
 	adbFailures, polls, consecFailures, illegible := 0, 0, 0, 0
+	sawPlaying := false
 	for {
 		elapsed := time.Since(start)
 		if elapsed >= c.tuneTimeout {
@@ -484,8 +495,18 @@ func waitForVideo(ctx context.Context, c *config) error {
 			}
 			// Past those two, at least one poll returned output, and the first one
 			// that did took the baseline -- so haveBase is necessarily true here.
-			return fmt.Errorf("no playback after %ds (adb ok on %d/%d polls, base=%s) -- device reported no secure decoder and no playing media session",
-				int(elapsed.Seconds()), polls-adbFailures, polls, orNone(strings.Join(baseIDs, ",")))
+			// Say what was actually seen. This message used to state the device
+			// reported nothing even when it had reported playback on every poll and
+			// the loop simply ran out of budget -- because CONFIRM could not be
+			// reached, or MIN_WAIT had not elapsed. It is the line people paste into
+			// a support thread, so it must not be a false statement about the box.
+			if sawPlaying {
+				return fmt.Errorf("no playback confirmed after %v (adb ok on %d/%d polls, base=%s) -- playback WAS seen but never held for CONFIRM=%d consecutive polls past MIN_WAIT=%v; lower CONFIRM or raise TUNE_TIMEOUT",
+					elapsed.Round(time.Millisecond), polls-adbFailures, polls,
+					orNone(strings.Join(baseIDs, ",")), c.confirm, c.minWait)
+			}
+			return fmt.Errorf("no playback after %v (adb ok on %d/%d polls, base=%s) -- device reported no secure decoder and no playing media session",
+				elapsed.Round(time.Millisecond), polls-adbFailures, polls, orNone(strings.Join(baseIDs, ",")))
 		}
 		polls++
 
@@ -589,6 +610,9 @@ func waitForVideo(ctx context.Context, c *config) error {
 				orNone(strings.Join(baseIDs, ",")), session, armed, hits, playing)
 		}
 
+		if playing {
+			sawPlaying = true
+		}
 		if playing && elapsed >= c.minWait {
 			hits++
 			if hits >= c.confirm {
@@ -1045,7 +1069,7 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 		// read as a colossal bitrate spike and trip the motion gate instantly --
 		// exactly the loading-screen false positive the gate exists to prevent.
 		if draining {
-			if readWait < c.drainIdle && drained < maxDrain {
+			if readWait < c.drainIdle && drained < maxDrain && time.Since(gateAt) < maxDrainTime {
 				// Counted as `caught-up`, not `discarded`. Adding it to both made the
 				// aligned log line overstate the alignment discard by the drain.
 				drained++
@@ -1087,7 +1111,17 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 				// from the output, which is a continuity break in the recording.
 				if elapsed <= 2*c.motionWindow {
 					rate := float64(winBytes) / elapsed.Seconds()
-					if floorRate < 0 || rate < floorRate {
+					// Only a window that actually carried a picture may set the floor.
+					// The 2x guard above catches long gaps, but a gap of one to two
+					// windows closes a window holding a packet or two, measures a rate
+					// two orders of magnitude below the truth, and pins the floor
+					// there -- after which the STATIC CARD reads as 6x motion and the
+					// gate opens on it, while the log reports a confident ratio. An
+					// all-null window is worse: rate 0 pins floorRate at 0, and the
+					// `floorRate > 0` test below then disables detection for the whole
+					// tune. Neither ever recovers, because the floor only decreases.
+					// An HDMI resync at the channel change produces exactly this.
+					if winBytes >= minWindowPackets*tsPacketSize && (floorRate < 0 || rate < floorRate) {
 						floorRate = rate
 					}
 					if floorRate > 0 && rate > floorRate*c.riseFactor {
