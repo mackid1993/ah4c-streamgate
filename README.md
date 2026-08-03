@@ -129,7 +129,7 @@ optimisation:
   programming was already running before we connected.
 - No keyframe within `ALIGN_TIMEOUT` + 2s — stream unaligned rather than produce no output at all. The cached PAT/PMT are still sent first, so the DVR does not additionally wait for the encoder's next table cycle.
 
-One thing the floor cannot tell you: everything measured *before* the gate came off a different picture, usually the channel you're leaving. If that channel was already playing, motion may register on it and wave the new channel's loading card straight through. `REARM_MOTION=1` throws that away and re-learns from the gate. It's off by default because a switch that never shows a card — a retune to what's already playing — then has no rise to find and pays the whole `MOTION_TIMEOUT`. Turn it on if you see the card and leave it off otherwise.
+Motion seen *before* the gate — the wake animation, the home screen, the app launching, the channel you're leaving — is never evidence about the new channel, so the latch is always dropped when the gate opens and motion must prove itself again on the new picture. The learned floor is kept, so a warm tune re-latches within `MOTION_HOLD` windows (~750ms at defaults, usually inside the keyframe wait it already pays) while the card, sitting at the floor, cannot. `REARM_MOTION=1` additionally forgets the floor itself — for apps whose pre-gate picture is so quiet that a kept floor would let the card read as a rise. Off by default; the same trade-off note below applies.
 
 ## Settings
 
@@ -162,7 +162,7 @@ The defaults are tuned; most people should never touch these.
 | `MOTION_HOLD` | `3` | Consecutive windows above the threshold before it counts as motion. Filters out brief spikes from the cut itself. |
 | `RISE_FACTOR` | `5` | How far above the quietest observed window a window must rise. A ratio, not a bitrate. |
 | `MOTION_TIMEOUT` | `6` | Give up waiting for motion after this long and release anyway. |
-| `REARM_MOTION` | `0` | Discard what the motion detector learned before the gate and re-learn from it. Closes the case where the previous channel's motion releases the new channel's loading card, at the cost of `MOTION_TIMEOUT` on switches that never show a card. |
+| `REARM_MOTION` | `0` | The motion *latch* is always dropped at the gate; this additionally forgets the learned *floor* and re-learns it from the new channel. Only needed if a splash frame survives the default behaviour, at the cost of `MOTION_TIMEOUT` on switches that never show a card. |
 | `READ_TIMEOUT` | `10` | Give up if the encoder holds the connection open but sends nothing for this long. Catches a lost HDMI input or a wedged encode thread, which TCP keepalive does not — the peer is still answering. Every successful read pushes it out, so it only fires on genuine silence. |
 | `DEBUG` | unset | Log every poll. |
 

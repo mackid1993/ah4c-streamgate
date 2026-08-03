@@ -1131,15 +1131,23 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) (wrote boo
 					// so this mode delivered strictly less than a plain byte copy.
 					injectTables()
 				}
-				// Opt-in. Everything measured before the gate came off a DIFFERENT
-				// picture -- usually the channel we are leaving -- so a rise seen
-				// back there can latch motionSeen and wave the new channel's loading
-				// card straight through. Re-learning from the gate closes that, but
-				// it is off by default because a switch that never shows a card (a
-				// retune to what is already playing) then has no rise to find and
-				// pays the whole MOTION_TIMEOUT.
+				// Motion observed before the gate is ALWAYS evidence about the
+				// previous picture -- the wake animation, the home screen, the app
+				// launching, the channel being left -- never about the new channel.
+				// Carrying the latch across the gate released alignment instantly
+				// (waited-for-motion=0ms, keyframes-skipped=0 in the field logs, with
+				// an 11Mbps "picture" rate no real channel runs) and the first
+				// keyframe could still be the loading card: a splash frame in the
+				// recording. The latch and streak are therefore always dropped here.
+				// The learned FLOOR is kept -- it is the quietest-window memory, and
+				// with it a warm tune re-latches in MOTION_HOLD windows (~750ms at
+				// defaults, usually inside the keyframe wait it already pays), while
+				// the card cannot re-latch because it sits at the floor, not above it.
+				motionSeen, motionStreak = false, 0
+				// Opt-in: REARM_MOTION additionally forgets the floor itself, for
+				// apps whose pre-gate picture is so quiet that a kept floor would let
+				// the card read as a rise.
 				if c.rearmMotion {
-					motionSeen, motionStreak = false, 0
 					// floor1/floor2 too, or the next window restores the pre-gate
 					// floor from them and `floorRate = -1` is a no-op -- which made
 					// REARM_MOTION do nothing at all to the thing it exists to reset.

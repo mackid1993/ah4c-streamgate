@@ -842,3 +842,84 @@ func TestWrongPIDPMTStillRecords(t *testing.T) {
 		t.Fatal("post-relaxation output is not a contiguous run of the input")
 	}
 }
+
+// Motion observed before the gate is always evidence about the previous
+// picture -- wake animation, home screen, the old channel -- never the new one.
+// Carrying the latch across the gate released alignment instantly and the first
+// keyframe could still be the loading card: the field logs showed
+// waited-for-motion=0ms, keyframes-skipped=0 on exactly the tunes that leaked a
+// splash frame. The latch must drop at the gate; the card, sitting at the
+// floor, must then hold alignment until the real picture rises.
+func TestPreGateMotionDoesNotReleaseOntoTheCard(t *testing.T) {
+	null := func(seq int) []byte {
+		p := make([]byte, tsPacketSize)
+		p[0], p[1], p[2], p[3] = 0x47, 0x1f, 0xff, 0x10
+		fill(p, 4, seq)
+		return p
+	}
+	var input []byte
+	input = append(input, patPacket(0)...)
+	input = append(input, pmtPacket(0)...)
+	seq := 1
+	quietBlock := func(key bool) {
+		for i := 0; i < 10; i++ {
+			input = append(input, videoPacket(byte(seq&0x0f), key && i == 0, seq)...)
+			seq++
+		}
+		for i := 0; i < 40; i++ {
+			input = append(input, null(seq)...)
+			seq++
+		}
+	}
+	// A: quiet pre-gate -- the floor learns what a still picture costs.
+	for b := 0; b < 5; b++ {
+		quietBlock(false)
+	}
+	// B: loud pre-gate -- the wake/app-launch burst that latches motion.
+	for i := 0; i < 250; i++ {
+		input = append(input, videoPacket(byte(seq&0x0f), false, seq)...)
+		seq++
+	}
+	gateAt := len(input) / tsPacketSize
+	// C: the loading card -- quiet again, with keyframes: the trap.
+	for b := 0; b < 6; b++ {
+		quietBlock(true)
+	}
+	dStart := len(input) / tsPacketSize
+	// D: real programming -- loud, keyframes every 50 packets.
+	for i := 0; i < 400; i++ {
+		input = append(input, videoPacket(byte(seq&0x0f), i%50 == 0, seq)...)
+		seq++
+	}
+
+	gate := make(chan struct{})
+	srv := serveTSGate(t, input, 2*time.Millisecond, gateAt, gate)
+	defer srv.Close()
+
+	c := testConfig(srv.URL)
+	c.waitMotion = true
+	c.motionWindow = 100 * time.Millisecond
+	c.riseFactor = 3
+	c.motionHold = 2
+	c.motionTimeout = 3 * time.Second
+	c.alignTimeout = 5 * time.Second
+
+	out := runStream(t, c, gate)
+	if len(out) < 3*tsPacketSize {
+		t.Fatal("no output at all")
+	}
+	// The head is the injected PAT and PMT; the video run starts after them.
+	rest := out[2*tsPacketSize:]
+	idx := bytes.Index(input, rest)
+	if idx < 0 || idx%tsPacketSize != 0 || idx+len(rest) != len(input) {
+		t.Fatal("output is not a contiguous run of the input")
+	}
+	start := idx / tsPacketSize
+	if !randomAccess(rest[:tsPacketSize]) {
+		t.Errorf("output does not start on a keyframe (packet %d)", start)
+	}
+	if start < dStart {
+		t.Errorf("output starts at packet %d, inside the loading card (card=%d..%d): pre-gate motion released alignment onto the card",
+			start, gateAt, dStart)
+	}
+}
