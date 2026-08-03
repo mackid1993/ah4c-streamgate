@@ -544,6 +544,7 @@ func waitForVideo(ctx context.Context, c *config) error {
 	}
 	sawPlaying := false
 	noTerminator, noTermPolls := false, 0
+	baseUnderLatch := false
 	var lastIDs []string
 	var lastSession, baseSession string
 	for {
@@ -635,9 +636,20 @@ func waitForVideo(ctx context.Context, c *config) error {
 				noTermPolls++
 				noTerminator = noTermPolls >= 3
 			} else {
-				// Consecutive, not cumulative: a build that prints the terminator
-				// sometimes has not proven it never does.
+				// A terminator sighting disproves the latch outright: this build DOES
+				// print one, so the terminator-less dumps were dumpsys dying mid-dump,
+				// not a vendor format. Three of those in a row latched trust and
+				// locked an EMPTY baseline -- after which the outgoing channel's
+				// decoder read as new and the gate opened on it in under 200ms. The
+				// latch is withdrawn, and a baseline locked under it is thrown away so
+				// this same complete, terminated dump relocks it a few lines down,
+				// BEFORE the new-codec comparison runs.
 				noTermPolls = 0
+				noTerminator = false
+				if baseUnderLatch {
+					haveCodecBase = false
+					baseUnderLatch = false
+				}
 			}
 		}
 		// A transport that truncates is the fault the reconnect exists for, so it
@@ -695,6 +707,7 @@ func waitForVideo(ctx context.Context, c *config) error {
 			if codecBaseOK {
 				haveCodecBase = true
 				baseIDs, baseSet = ids, setOf(ids)
+				baseUnderLatch = noTerminator
 			}
 			baseSession = session
 			if c.debug {
@@ -711,6 +724,7 @@ func waitForVideo(ctx context.Context, c *config) error {
 		if !haveCodecBase && codecBaseOK {
 			haveCodecBase = true
 			baseIDs, baseSet = ids, setOf(ids)
+			baseUnderLatch = noTerminator
 			if c.debug {
 				logf(c, "codec baseline locked at poll %d: %s", polls, orNone(strings.Join(baseIDs, ",")))
 			}

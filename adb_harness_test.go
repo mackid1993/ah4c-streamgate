@@ -1505,3 +1505,37 @@ func TestNoTerminatorBuildStillGetsCodecSignal(t *testing.T) {
 		t.Errorf("want detection via the codec signal, got:\n%s", log)
 	}
 }
+
+// Three consecutive dumps where dumpsys dies after printing "Processes:" -- but
+// the shell survives to echo both markers -- used to latch noTerminator on a
+// build that DOES print terminators. The latched trust believed the empty cut
+// dump, locked an empty baseline, and the next full dump fired the gate on the
+// OUTGOING channel's decoder within 200ms. A terminator sighting now disproves
+// the latch and relocks the baseline from the full dump before comparing.
+func TestFlakyDumpsysDoesNotFalseLatchTheTerminator(t *testing.T) {
+	cut := "Processes:\n__MS__\n__MS2__\n"
+	full := func(ids string) string {
+		return "Processes:\n" + ids + "Events logs:\n__MS__\n__MS2__\n"
+	}
+	old := "  Pid: 100\n    Id: OLD\n    {name: secure-codec, subType: video-codec, value: 1}\n"
+	hNewADB(t,
+		hStep{raw: cut},
+		hStep{raw: cut},
+		hStep{raw: cut}, // the false latch, and an empty baseline under it
+		hStep{raw: full(old)},
+		hStep{raw: full(old)},
+		hStep{raw: full(old + "  Pid: 200\n    Id: NEW\n    {name: secure-codec, subType: video-codec, value: 1}\n")},
+	)
+	c := hConfig()
+	c.tuneTimeout = 3 * time.Second
+	err, _, log := hWait(t, c)
+	if err != nil {
+		t.Fatalf("tune failed: %v\nlog:\n%s", err, log)
+	}
+	if strings.Contains(log, "via codec OLD") {
+		t.Fatalf("gate opened on the outgoing channel's decoder:\n%s", log)
+	}
+	if !strings.Contains(log, "via codec NEW") {
+		t.Errorf("want detection via codec NEW, got:\n%s", log)
+	}
+}
