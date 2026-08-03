@@ -86,6 +86,25 @@ So when the gate opens, streamgate skips forward to the next keyframe and starts
 
 If your encoder doesn't mark keyframes in a way it recognises, it gives up after `ALIGN_TIMEOUT` and streams normally rather than sitting there discarding forever.
 
+### Why this also skips the app's tuning screen
+
+There's a second effect here that is worth understanding, because it does more work than any setting in this program and you would never guess it from the code.
+
+Most streaming apps show a loading card while a channel comes up — DirecTV shows a blue screen with the channel logo. The video decoder is allocated *while that card is still on screen*, so gating purely on "a decoder exists" can start your recording on the card rather than on the programme.
+
+What saves you is the encoder. A hard cut from a static card to live video is an unmistakable **scene change**, and essentially every modern encoder responds by inserting an extra keyframe right at that moment, off its normal cycle. Measured on a 2-second GOP, through a real tune:
+
+```
+gap 0.88s   <-- off-cycle keyframe: the card cutting to video
+gap 2.04s
+gap 2.00s
+gap 2.00s   <-- steady cycle resumes
+```
+
+So "skip forward to the next keyframe" lands on the first frame of actual programming **by construction**, not by luck. That is why the tuning card doesn't end up in recordings, and why it holds even on a cold box where the card is on screen much longer.
+
+**This depends on your encoder inserting keyframes on scene change.** Nearly all do. One with a strictly fixed GOP that only emits keyframes on a timer will not, and on that hardware you may occasionally catch the tail of a loading card. That is what `SETTLE` and `WAIT_AUDIO` are for — see below.
+
 ---
 
 ## Settings
@@ -97,7 +116,7 @@ All optional, all environment variables. The defaults are tuned; most people sho
 | `CONFIRM` | `1` | Consecutive sightings required before handing off. Raise to `2`+ if a splash frame slips through. |
 | `POLL` | `0.25` | Seconds between polls while waiting for a first sighting. |
 | `CONFIRM_POLL` | `0.05` | Seconds between polls once something has been sighted. Confirming is on the critical path, so it polls tight. |
-| `SETTLE` | `0.25` | Pause after detecting, before opening the gate. **See below — this is the anti-flash setting.** |
+| `SETTLE` | `0.25` | Pause after detecting, before opening the gate. See "if a recording starts on the app's tuning screen" below. |
 | `MIN_WAIT` | `1` | Ignore "playing" for this many seconds after start. |
 | `TUNE_TIMEOUT` | `40` | Give up after this long. Costs nothing on a tune that works — the wait ends the moment playback is detected. |
 | `ON_TIMEOUT` | `fail` | `fail` exits without streaming, so your DVR sees a dead tune and can retry or pick another tuner. Anything else streams whatever is on screen. |
@@ -107,13 +126,15 @@ All optional, all environment variables. The defaults are tuned; most people sho
 | `RENDER_TIMEOUT` | `3` | Cap on that wait, so a device that never reports audio still tunes. |
 | `DEBUG` | unset | Log every poll. |
 
-### If you see a brief flash at the start of a recording
+### If a recording starts on the app's tuning screen
 
-Raise `SETTLE`.
+First, see the section above — on most encoders the scene-change keyframe handles this for you, and there is nothing to tune.
 
-The decoder is allocated slightly before the box actually puts a picture on HDMI. Without keyframe alignment that gap was invisible — your DVR was discarding everything up to the next keyframe anyway, which usually carried past it. Aligning removes that accidental slack, so those first frames become visible.
+If yours doesn't, you have two options, in order:
 
-`SETTLE=0.25` covers it on the hardware this was developed against. If yours is slower, try `0.5`. If a flash still survives, `WAIT_AUDIO=1` waits for the actual render signal instead of a fixed pause — correct, but it costs the real time the box takes to start rendering.
+**Raise `SETTLE`.** The decoder is allocated a little before the app puts real video on screen. `SETTLE` is a flat pause covering that gap; `0.5` or `0.75` is a reasonable next step. Cheap, but it's a timer — it doesn't know what's on screen, so it can be too short on a slow tune and wasted time on a fast one.
+
+**Or set `WAIT_AUDIO=1`.** This waits for the app to actually start audio playback before opening the gate. It's the stronger signal for exactly this problem: **a tuning card doesn't play audio.** An audio track reaching the started state means the stream itself is decoding, not merely that a decoder object exists. It costs the real time the box takes to begin playback — roughly 0.7s on the hardware this was developed against — and it is bounded by `RENDER_TIMEOUT` so a device that never reports audio still tunes.
 
 ---
 
