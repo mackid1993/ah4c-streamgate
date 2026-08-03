@@ -549,11 +549,17 @@ func TestStreamIgnoresPSIContinuation(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		input = append(input, videoPacket(byte(i), false, i+1)...)
 	}
-	// PID 0 with payload_unit_start CLEAR and a body that parses to nonsense.
-	cont := make([]byte, tsPacketSize)
-	cont[0], cont[1], cont[2], cont[3] = 0x47, 0x00, 0x00, 0x11
-	fill(cont, 4, 0x55)
-	input = append(input, cont...)
+	// payload_unit_start CLEAR with a body that parses to nonsense, on BOTH PSI
+	// pids: the PAT and the PMT are cached and parsed by separate branches, and a
+	// fixture with only one of them leaves the other branch untested.
+	patCont := make([]byte, tsPacketSize)
+	patCont[0], patCont[1], patCont[2], patCont[3] = 0x47, 0x00, 0x00, 0x11
+	fill(patCont, 4, 0x55)
+	input = append(input, patCont...)
+	pmtCont := make([]byte, tsPacketSize)
+	pmtCont[0], pmtCont[1], pmtCont[2], pmtCont[3] = 0x47, pmtHi, pmtLo, 0x11
+	fill(pmtCont, 4, 0x66)
+	input = append(input, pmtCont...)
 	for i := 5; i < 40; i++ {
 		input = append(input, videoPacket(byte(i&0x0f), i%10 == 0, i+1)...)
 	}
@@ -640,5 +646,51 @@ func TestZeroWhereItIsDocumented(t *testing.T) {
 	}
 	for _, k := range []string{"MIN_WAIT", "SETTLE", "DRAIN_IDLE", "POLL", "ENCODER9_URL"} {
 		os.Unsetenv(k)
+	}
+}
+
+// The parsers are fed 200k random packets by TestParsersDoNotPanic, which
+// asserts nothing about what comes back. These pin the two bounds that were
+// wrong, on the malformed shapes that fuzz was already producing blind.
+func TestParserBounds(t *testing.T) {
+	// A PMT whose ES loop is followed by a four-byte remainder before the CRC.
+	// With the loop bounded at i+4 <= end, the entry at that boundary reads its
+	// length field out of the CRC and invents an elementary stream.
+	pmt := make([]byte, 60)
+	pmt[0] = 0x02
+	pmt[1], pmt[2] = 0xb0, 22 // section_length: 9 header + 5 ES + 4 filler + 4 CRC
+	pmt[3], pmt[4] = 0x00, 0x01
+	pmt[5], pmt[6], pmt[7] = 0xc1, 0x00, 0x00
+	pmt[8], pmt[9] = 0xe0|vidHi, vidLo // PCR pid
+	pmt[10], pmt[11] = 0xf0, 0x00      // program_info_length 0
+	pmt[12] = 0x1b                     // the one real elementary stream
+	pmt[13], pmt[14] = 0xe0|vidHi, vidLo
+	pmt[15], pmt[16] = 0xf0, 0x00
+	// Four bytes of remainder that read as a plausible H.264 entry on pid 0x0099.
+	pmt[17] = 0x1b
+	pmt[18], pmt[19] = 0xe0, 0x99
+	pmt[20] = 0xf0
+
+	got := videoPIDs(pmt)
+	if !got[testVideoPid] {
+		t.Errorf("videoPIDs lost the real video pid: %v", got)
+	}
+	if got[0x0099] {
+		t.Error("videoPIDs invented a pid from the section remainder and the CRC")
+	}
+	if len(got) != 1 {
+		t.Errorf("videoPIDs = %v, want exactly one pid", got)
+	}
+
+	// afc 0 is reserved: the packet carries no payload at all.
+	pkt := make([]byte, tsPacketSize)
+	pkt[0], pkt[1], pkt[2], pkt[3] = 0x47, 0x40, 0x00, 0x00
+	if pl := payload(pkt, true); pl != nil {
+		t.Errorf("payload() returned %d bytes for afc=0, want nil", len(pl))
+	}
+	// afc 2 is adaptation-field-only; same answer, and it already worked.
+	pkt[3] = 0x20
+	if pl := payload(pkt, true); pl != nil {
+		t.Errorf("payload() returned %d bytes for afc=2, want nil", len(pl))
 	}
 }
