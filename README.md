@@ -92,18 +92,36 @@ There's a second effect here that is worth understanding, because it does more w
 
 Most streaming apps show a loading card while a channel comes up — DirecTV shows a blue screen with the channel logo. The video decoder is allocated *while that card is still on screen*, so gating purely on "a decoder exists" can start your recording on the card rather than on the programme.
 
-What saves you is the encoder. A hard cut from a static card to live video is an unmistakable **scene change**, and essentially every modern encoder responds by inserting an extra keyframe right at that moment, off its normal cycle. Measured on a 2-second GOP, through a real tune:
+What saves you is the encoder, and the mechanism is worth spelling out because it has a clear boundary.
+
+A total picture change is a **scene change**, and encoders respond by forcing a keyframe: predicting the new picture from the old one would cost more bits than just sending a fresh one. Crucially, a forced keyframe also **resets the encoder's GOP timer**. So a tune produces *two* forced keyframes — one when programming cuts to the card, one when the card cuts to programming — and between them the regular cycle is suspended.
+
+Measured across three real tunes on a 2-second GOP, the gaps between keyframes:
 
 ```
-gap 0.88s   <-- off-cycle keyframe: the card cutting to video
-gap 2.04s
-gap 2.00s
-gap 2.00s   <-- steady cycle resumes
+tune 1:  ... 2.00   2.00   1.20   <-- off-cycle
+tune 2:  0.75  <-- off-cycle      2.06   2.00   2.00 ...
+tune 3:  1.77  <-- off-cycle      2.04   2.00   2.00 ...
 ```
 
-So "skip forward to the next keyframe" lands on the first frame of actual programming **by construction**, not by luck. That is why the tuning card doesn't end up in recordings, and why it holds even on a cold box where the card is on screen much longer.
+Exactly one short gap per tune — that gap *is* the loading card — then the steady cycle resumes.
 
-**This depends on your encoder inserting keyframes on scene change.** Nearly all do. One with a strictly fixed GOP that only emits keyframes on a timer will not, and on that hardware you may occasionally catch the tail of a loading card. That is what `SETTLE` and `WAIT_AUDIO` are for — see below.
+Because the card's appearance reset the timer, the next scheduled keyframe is not due until a full GOP later, and the card ends first. **No scheduled keyframe exists inside the card**, so the next keyframe after the gate opens can only be the one at the cut. Alignment lands on the first frame of programming.
+
+### The boundary: your loading screen must be shorter than one GOP
+
+That is the whole condition. Above, the card ran 0.75–1.77s against a 2.00s GOP.
+
+If an app's loading sequence outlives one GOP, a scheduled keyframe *does* appear inside it, alignment lands on that instead, and you record the tail of the loading screen. Two things make this likely:
+
+- **Long startups.** A deeplink into an already-running app shows a brief card. An app that cold-starts, plays an intro animation, then buffers can easily exceed two seconds.
+- **Animated intros.** A static card produces one clean scene change at each end. A moving animation can trip the encoder's scene-change detector repeatedly, leaving keyframes *inside* the sequence to land on.
+
+There is a counterintuitive consequence: **a longer GOP makes this more robust**, because it leaves more room for the loading screen to fit inside one cycle.
+
+If your app has a long or animated startup, set `WAIT_AUDIO=1`. An intro animation doesn't play media audio, so audio starting is a direct signal that the animation is over and the stream is decoding — see below.
+
+**This also assumes your encoder inserts keyframes on scene change.** Nearly all do. One with a strictly fixed GOP, emitting keyframes only on a timer, will not — and there too `SETTLE` and `WAIT_AUDIO` are the answer.
 
 ---
 
