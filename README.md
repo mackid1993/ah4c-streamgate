@@ -149,6 +149,7 @@ The defaults are tuned; most people should never touch these.
 | `RENDER_TIMEOUT` | `3` | Cap on that wait, so a device that never reports audio still tunes. |
 | `WAIT_MOTION` | `1` | Wait for the picture to start moving before releasing. `0` releases on the first keyframe. |
 | `MOTION_WINDOW` | `0.25` | Seconds per measurement window. |
+| `DRAIN_IDLE` | `500us` | At handoff, discard video the encoder sent while we were still waiting on the box, so playback starts from live rather than from whatever had queued up. A read faster than this came from a buffer, not the network. `0` disables it. |
 | `MOTION_HOLD` | `3` | Consecutive windows above the threshold before it counts as motion. Filters out brief spikes from the cut itself. |
 | `RISE_FACTOR` | `5` | How far above the quietest observed window a window must rise. A ratio, not a bitrate. |
 | `MOTION_TIMEOUT` | `6` | Give up waiting for motion after this long and release anyway. |

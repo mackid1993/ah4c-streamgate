@@ -42,6 +42,12 @@ import (
 )
 
 const (
+	// A read that returns faster than this came out of a buffer rather than off
+	// the network. 500us is far above the few microseconds a buffered copy takes
+	// and far below the milliseconds between packets at any realistic bitrate.
+	// DRAIN_IDLE=0 turns catching up off entirely.
+	maxDrain = 20000 // ~3.7MB, a stop so a bursting encoder cannot spin
+
 	tsPacketSize = 188
 	// After ALIGN_TIMEOUT we stop insisting on motion and take any keyframe;
 	// this is the extra grace before giving up on alignment entirely.
@@ -66,6 +72,7 @@ type config struct {
 	riseFactor    float64
 	motionHold    int
 	motionWindow  time.Duration
+	drainIdle     time.Duration
 	readTimeout   time.Duration
 	waitAudio     bool
 	renderTimeout time.Duration
@@ -191,6 +198,7 @@ func loadConfig() (*config, error) {
 		riseFactor:    envFloat("RISE_FACTOR", 5.0),
 		motionHold:    envInt("MOTION_HOLD", 3),
 		motionWindow:  envDur("MOTION_WINDOW", 250*time.Millisecond),
+		drainIdle:     envDur("DRAIN_IDLE", 500*time.Microsecond),
 		readTimeout:   envDur("READ_TIMEOUT", 10*time.Second),
 		waitAudio:     envBool("WAIT_AUDIO", false),
 		renderTimeout: envDur("RENDER_TIMEOUT", 3*time.Second),
@@ -598,7 +606,12 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 
 	wrote := false
 	sent := 0
-	br := bufio.NewReaderSize(resp.Body, 1<<16)
+	// 8KB, not 64KB. Whatever sits in this buffer is video we have taken off the
+	// socket but not yet emitted, so its size is a ceiling on how far behind live
+	// we can be. At a typical 3-4 Mbps, 64KB is ~160ms of held video; 8KB is
+	// ~20ms. The cost is more read syscalls -- about 50/sec instead of 6 -- which
+	// at ~1us each is nothing.
+	br := bufio.NewReaderSize(resp.Body, 1<<13)
 
 	// Coalesce writes without ever holding video back.
 	//
@@ -644,6 +657,9 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 	var motionAt time.Time
 	var motionRate, motionFloor float64
 	var gateAt time.Time
+	draining := false
+	drained := 0
+	var readWait time.Duration
 
 	for {
 		if !open {
@@ -651,6 +667,7 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 			case <-gate:
 				open = true
 				gateAt = time.Now()
+				draining = c.drainIdle > 0
 				if !c.alignKey {
 					aligned = true
 				}
@@ -677,6 +694,10 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 			}
 		}
 
+		var readStart time.Time
+		if draining {
+			readStart = time.Now()
+		}
 		if err := readPacket(br, pkt); err != nil {
 			flush()
 			// An encoder with no input can answer 200 with an empty body. Treating
@@ -689,6 +710,9 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 			// with no log line at all.
 			return fmt.Errorf("encoder ended the stream after %s and %.1f MB (%v)",
 				time.Since(gateAt).Round(time.Second), float64(sent)/(1<<20), err)
+		}
+		if draining {
+			readWait = time.Since(readStart)
 		}
 
 		p := pid(pkt)
@@ -709,6 +733,37 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 					vidPids = m
 				}
 			}
+		}
+
+		// Catch up to live before choosing a keyframe.
+		//
+		// We connect to the encoder early, because the motion gate has to watch the
+		// stream to learn what a still picture costs before it can recognise
+		// movement. That means the encoder is sending for several seconds while we
+		// are still waiting on the box, and anything we have not consumed sits in
+		// the socket buffer. Align without clearing it and we lock onto a keyframe
+		// that is ALREADY old, then stay exactly that far behind live for the whole
+		// recording -- video still arrives, it is just permanently late.
+		//
+		// So discard whatever was queued, and detect the end of the queue by timing
+		// the reads: buffered packets are handed over in microseconds, while at live
+		// each read has to wait for the network. The first read that actually waits
+		// means the queue is empty and we are current. Bounded by maxDrain so an
+		// encoder that genuinely bursts faster than real time cannot spin here.
+		//
+		// This runs before the motion accounting below on purpose. A drained burst
+		// arrives thousands of times faster than real time, and counting it would
+		// read as a colossal bitrate spike and trip the motion gate instantly --
+		// exactly the loading-screen false positive the gate exists to prevent.
+		if draining {
+			if readWait < c.drainIdle && drained < maxDrain {
+				drained++
+				discarded++
+				continue
+			}
+			draining = false
+			// Restart the measurement window; the one in progress spans the burst.
+			winBytes, winStart = 0, time.Now()
 		}
 
 		// Tell a loading screen from programming by how hard the picture is to
@@ -800,8 +855,9 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 			// video-pid  : which PID carried the keyframe we started on
 			// discarded  : bytes dropped between the gate opening and that keyframe
 			// gate-to-air: total time from the gate opening to the first byte out
-			logf(c, "aligned video-pid=%d discarded=%d packets/%.0fKB gate-to-air=%.2fs %s",
+			logf(c, "aligned video-pid=%d discarded=%d packets/%.0fKB caught-up=%.0fKB gate-to-air=%.2fs %s",
 				p, discarded, float64(discarded*tsPacketSize)/1024,
+				float64(drained*tsPacketSize)/1024,
 				time.Since(gateAt).Seconds(), path)
 			if lastPAT != nil {
 				batch = append(batch, lastPAT...)
