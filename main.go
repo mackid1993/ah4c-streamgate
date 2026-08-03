@@ -38,21 +38,31 @@ import (
 	"time"
 )
 
-const tsPacketSize = 188
+const (
+	tsPacketSize = 188
+	// After ALIGN_TIMEOUT we stop insisting on motion and take any keyframe;
+	// this is the extra grace before giving up on alignment entirely.
+	relaxWindow = 2 * time.Second
+)
 
 type config struct {
-	tuner       string
-	tunerIP     string
-	encoderURL  string
-	minWait     time.Duration
-	tuneTimeout time.Duration
-	confirm     int
-	poll        time.Duration
-	confirmPoll time.Duration
-	settle      time.Duration
+	tuner         string
+	tunerIP       string
+	encoderURL    string
+	minWait       time.Duration
+	tuneTimeout   time.Duration
+	confirm       int
+	poll          time.Duration
+	confirmPoll   time.Duration
+	settle        time.Duration
 	onTimeout     string
 	alignKey      bool
 	alignTimeout  time.Duration
+	waitMotion    bool
+	motionTimeout time.Duration
+	riseFactor    float64
+	motionHold    int
+	motionWindow  time.Duration
 	waitAudio     bool
 	renderTimeout time.Duration
 	debug         bool
@@ -79,6 +89,15 @@ func envDur(k string, def time.Duration) time.Duration {
 		return def
 	}
 	return time.Duration(f * float64(time.Second))
+}
+
+func envFloat(k string, def float64) float64 {
+	if v := os.Getenv(k); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return def
 }
 
 func envInt(k string, def int) int {
@@ -108,10 +127,15 @@ func loadConfig() (*config, error) {
 		// short settle here keeps keyframe alignment from landing on pre-render
 		// frames and showing a brief blue/black flash at the head of a recording.
 		// Far cheaper than waiting for the render signal proper (~0.7s).
-		settle:      envDur("SETTLE", 250*time.Millisecond),
+		settle:        envDur("SETTLE", 250*time.Millisecond),
 		onTimeout:     env("ON_TIMEOUT", "fail"),
 		alignKey:      env("ALIGN_KEYFRAME", "1") != "0",
-		alignTimeout:  envDur("ALIGN_TIMEOUT", 5*time.Second),
+		alignTimeout:  envDur("ALIGN_TIMEOUT", 8*time.Second),
+		waitMotion:    env("WAIT_MOTION", "1") != "0",
+		motionTimeout: envDur("MOTION_TIMEOUT", 6*time.Second),
+		riseFactor:    envFloat("RISE_FACTOR", 5.0),
+		motionHold:    envInt("MOTION_HOLD", 3),
+		motionWindow:  envDur("MOTION_WINDOW", 250*time.Millisecond),
 		waitAudio:     env("WAIT_AUDIO", "0") != "0",
 		renderTimeout: envDur("RENDER_TIMEOUT", 3*time.Second),
 		debug:         os.Getenv("DEBUG") != "",
@@ -460,6 +484,14 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 	aligned := false
 	pkt := make([]byte, tsPacketSize)
 	discarded := 0
+	skippedKeys := 0
+	winBytes := 0
+	winStart := time.Now()
+	floorRate := -1.0
+	motionSeen := false
+	motionStreak := 0
+	var motionAt time.Time
+	var motionRate, motionFloor float64
 	var gateAt time.Time
 
 	for {
@@ -481,9 +513,9 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 		// forever and the tune would produce no output at all -- far worse than
 		// the mid-GOP start we were trying to improve on. Give up and pass the
 		// bytes through instead.
-		if open && !aligned && time.Since(gateAt) > c.alignTimeout {
+		if open && !aligned && time.Since(gateAt) > c.alignTimeout+relaxWindow {
 			aligned = true
-			logf(c, "no keyframe found within %s (encoder may not signal random access); streaming unaligned", c.alignTimeout)
+			logf(c, "no keyframe at all within %s; streaming unaligned", c.alignTimeout+relaxWindow)
 		}
 
 		if err := readPacket(br, pkt); err != nil {
@@ -511,6 +543,32 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 			}
 		}
 
+		// Tell a loading screen from programming by how hard the picture is to
+		// compress: a static card costs the encoder almost nothing, moving video
+		// costs it everything. Nothing here is compared against a fixed bitrate,
+		// because absolute numbers are meaningless across encoders, resolutions
+		// and quality settings. The stream calibrates itself -- remember the
+		// quietest window seen, and call it motion when a window rises well above
+		// that floor and HOLDS, since the cut itself produces brief spikes.
+		winBytes += tsPacketSize
+		if now := time.Now(); now.Sub(winStart) >= c.motionWindow {
+			rate := float64(winBytes) / now.Sub(winStart).Seconds()
+			if floorRate < 0 || rate < floorRate {
+				floorRate = rate
+			}
+			if floorRate > 0 && rate > floorRate*c.riseFactor {
+				motionStreak++
+				if !motionSeen && motionStreak >= c.motionHold {
+					motionSeen = true
+					motionAt = now
+					motionRate, motionFloor = rate, floorRate
+				}
+			} else {
+				motionStreak = 0
+			}
+			winBytes, winStart = 0, now
+		}
+
 		if !open {
 			continue
 		}
@@ -524,9 +582,34 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 				discarded++
 				continue
 			}
+
+			// HAPPY -- programming already flowing, the next keyframe is a real
+			// picture. SAD -- still on the loading screen; taking a keyframe now
+			// records the card, so wait for the picture to start moving. Bounded:
+			// a constant-bitrate encoder, or a box that was never slept so there
+			// is no rise to see, falls through on MOTION_TIMEOUT.
+			if c.waitMotion && !motionSeen && time.Since(gateAt) < c.motionTimeout {
+				skippedKeys++
+				discarded++
+				continue
+			}
 			aligned = true
-			logf(c, "aligned to keyframe on pid %d after discarding %d packets (%.0f KB)",
-				p, discarded, float64(discarded*tsPacketSize)/1024)
+			var path string
+			waitedForMotion := motionSeen && motionAt.After(gateAt)
+			switch {
+			case !c.waitMotion:
+				path = "motion gate disabled"
+			case motionSeen && !waitedForMotion:
+				path = fmt.Sprintf("HAPPY: already moving when gate opened (%.0f kbps vs %.0f floor)", motionRate*8/1000, motionFloor*8/1000)
+			case waitedForMotion:
+				path = fmt.Sprintf("SAD: held %.2fs for the loading screen to end, skipped %d keyframe(s) (%.0f kbps vs %.0f floor)",
+					motionAt.Sub(gateAt).Seconds(), skippedKeys, motionRate*8/1000, motionFloor*8/1000)
+			default:
+				path = "no motion rise within " + c.motionTimeout.String() + "; took keyframe anyway"
+			}
+			logf(c, "aligned on pid %d after %d packets (%.0f KB, %.2fs) -- %s",
+				p, discarded, float64(discarded*tsPacketSize)/1024,
+				time.Since(gateAt).Seconds(), path)
 			if lastPAT != nil {
 				out.Write(lastPAT)
 			}

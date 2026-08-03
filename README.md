@@ -86,44 +86,42 @@ So when the gate opens, streamgate skips forward to the next keyframe and starts
 
 If your encoder doesn't mark keyframes in a way it recognises, it gives up after `ALIGN_TIMEOUT` and streams normally rather than sitting there discarding forever.
 
-### Why this also skips the app's tuning screen
+### Waiting for the picture to actually move
 
-There's a second effect here that is worth understanding, because it does more work than any setting in this program and you would never guess it from the code.
+Aligning to a keyframe is not enough on its own, because the app's loading
+screen is *also* made of keyframes. DirecTV shows a blue card with the channel
+logo; other apps show a spinner or an intro animation. The video decoder is
+allocated while that is still on screen, so the first keyframe after the gate
+opens can easily be the card — and you record it.
 
-Most streaming apps show a loading card while a channel comes up — DirecTV shows a blue screen with the channel logo. The video decoder is allocated *while that card is still on screen*, so gating purely on "a decoder exists" can start your recording on the card rather than on the programme.
+So before releasing, streamgate waits for the picture to start moving.
 
-What saves you is the encoder, and the mechanism is worth spelling out because it has a clear boundary.
+It works this out from the stream itself, with no extra cost, because it is
+already reading every byte. A still card compresses to almost nothing; moving
+video does not. It measures how much data each short window carries, remembers
+the quietest window it has seen, and calls it motion when a window rises well
+above that floor **and stays there** — a single spike is not enough, since the
+cut itself and any animation produce brief ones.
 
-A total picture change is a **scene change**, and encoders respond by forcing a keyframe: predicting the new picture from the old one would cost more bits than just sending a fresh one. Crucially, a forced keyframe also **resets the encoder's GOP timer**. So a tune produces *two* forced keyframes — one when programming cuts to the card, one when the card cuts to programming — and between them the regular cycle is suspended.
+**Nothing is compared against a fixed bitrate.** Absolute numbers are
+meaningless across encoders, resolutions and quality settings — one channel here
+runs real programming at 2,900 kbps where another runs 6,900. The floor is
+learned per stream, and the test is a ratio, so it travels.
 
-Measured across three real tunes on a 2-second GOP, the gaps between keyframes:
+- **Warm tune, programming already flowing** — motion is already present, the
+  next keyframe is released immediately. Costs nothing.
+- **Cold box, or an app that cold-starts with an intro** — the gate holds until
+  the picture moves, then releases on the next keyframe. Only tunes that need it
+  pay for it.
 
-```
-tune 1:  ... 2.00   2.00   1.20   <-- off-cycle
-tune 2:  0.75  <-- off-cycle      2.06   2.00   2.00 ...
-tune 3:  1.77  <-- off-cycle      2.04   2.00   2.00 ...
-```
+It is bounded at every stage, because the failure modes matter more than the
+optimisation:
 
-Exactly one short gap per tune — that gap *is* the loading card — then the steady cycle resumes.
-
-Because the card's appearance reset the timer, the next scheduled keyframe is not due until a full GOP later, and the card ends first. **No scheduled keyframe exists inside the card**, so the next keyframe after the gate opens can only be the one at the cut. Alignment lands on the first frame of programming.
-
-### The boundary: your loading screen must be shorter than one GOP
-
-That is the whole condition. Above, the card ran 0.75–1.77s against a 2.00s GOP.
-
-If an app's loading sequence outlives one GOP, a scheduled keyframe *does* appear inside it, alignment lands on that instead, and you record the tail of the loading screen. Two things make this likely:
-
-- **Long startups.** A deeplink into an already-running app shows a brief card. An app that cold-starts, plays an intro animation, then buffers can easily exceed two seconds.
-- **Animated intros.** A static card produces one clean scene change at each end. A moving animation can trip the encoder's scene-change detector repeatedly, leaving keyframes *inside* the sequence to land on.
-
-There is a counterintuitive consequence: **a longer GOP makes this more robust**, because it leaves more room for the loading screen to fit inside one cycle.
-
-If your app has a long or animated startup, set `WAIT_AUDIO=1`. An intro animation doesn't play media audio, so audio starting is a direct signal that the animation is over and the stream is decoding — see below.
-
-**This also assumes your encoder inserts keyframes on scene change.** Nearly all do. One with a strictly fixed GOP, emitting keyframes only on a timer, will not — and there too `SETTLE` and `WAIT_AUDIO` are the answer.
-
----
+- No rise within `MOTION_TIMEOUT` — release anyway. Covers a constant-bitrate
+  encoder, where there is no rise to detect, and a box that was never slept so
+  programming was already running before we connected.
+- No keyframe within `ALIGN_TIMEOUT` — take any keyframe.
+- Still nothing 2s later — stream unaligned rather than produce no output at all.
 
 ## Settings
 
@@ -142,6 +140,11 @@ All optional, all environment variables. The defaults are tuned; most people sho
 | `ALIGN_TIMEOUT` | `5` | If no keyframe is recognised within this long, stream unaligned rather than stall. |
 | `WAIT_AUDIO` | `0` | After the decoder appears, also wait for audio playback to start. Costs ~0.7s. Only needed if a flash survives `SETTLE`. |
 | `RENDER_TIMEOUT` | `3` | Cap on that wait, so a device that never reports audio still tunes. |
+| `WAIT_MOTION` | `1` | Wait for the picture to start moving before releasing. `0` releases on the first keyframe. |
+| `MOTION_WINDOW` | `0.25` | Seconds per measurement window. |
+| `MOTION_HOLD` | `3` | Consecutive windows above the threshold before it counts as motion. Filters out brief spikes from the cut itself. |
+| `RISE_FACTOR` | `5` | How far above the quietest observed window a window must rise. A ratio, not a bitrate. |
+| `MOTION_TIMEOUT` | `6` | Give up waiting for motion after this long and release anyway. |
 | `DEBUG` | unset | Log every poll. |
 
 ### If a recording starts on the app's tuning screen
