@@ -694,3 +694,33 @@ func TestParserBounds(t *testing.T) {
 		t.Errorf("payload() returned %d bytes for afc=2, want nil", len(pl))
 	}
 }
+
+// rmWhole is the whole defence against a truncated resource dump becoming the
+// codec baseline, and replacing its body with `return true` used to leave the
+// entire suite green.
+func TestRMWhole(t *testing.T) {
+	const whole = "Processes:\n  Pid: 1\n    Id: A\n    {name: secure-codec, subType: video-codec, value: 1}\nEvents logs:\n"
+	cases := []struct {
+		name         string
+		rm           string
+		ids          []string
+		noTerminator bool
+		want         bool
+	}{
+		{"complete with a decoder", whole, []string{"A"}, false, true},
+		{"complete and idle", "Processes:\nEvents logs:\n", nil, false, true},
+		{"cut before any decoder", "Processes:\n  Pid: 1\n    Id:", nil, false, false},
+		// The dangerous shape: enough arrived to look parsed, so decoder #2 would
+		// read as new and open the gate on the channel being left.
+		{"cut after the first decoder", "Processes:\n  Pid: 1\n    Id: A\n    {name: secure-codec, subType: video-codec, value: 1}\n  Pid: 2\n    Id: B", []string{"A"}, false, false},
+		// ...unless this build has shown us it never prints a terminator, where
+		// refusing everything would kill the codec signal outright.
+		{"same, on a build with no terminator", "Processes:\n  Pid: 1\n    Id: A\n    {name: secure-codec, subType: video-codec, value: 1}\n  Pid: 2\n    Id: B", []string{"A"}, true, true},
+		{"idle, no terminator, relaxed", "Processes:\n", nil, true, false},
+	}
+	for _, c := range cases {
+		if got := rmWhole(c.rm, c.ids, c.noTerminator); got != c.want {
+			t.Errorf("%s: rmWhole = %v, want %v", c.name, got, c.want)
+		}
+	}
+}

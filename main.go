@@ -485,6 +485,7 @@ func waitForVideo(ctx context.Context, c *config) error {
 	hits := 0
 	adbFailures, polls, consecFailures, illegible := 0, 0, 0, 0
 	sawPlaying := false
+	noTerminator, noTermPolls := false, 0
 	var lastIDs []string
 	var lastSession, baseSession string
 	for {
@@ -569,6 +570,12 @@ func waitForVideo(ctx context.Context, c *config) error {
 		// baseline; requiring the resource half outright made every tune fail on a
 		// box that simply has no resource manager. They are different questions.
 		rmLegible := strings.Contains(rm, "Processes:") || strings.Contains(rm, "Events logs")
+		// After enough legible dumps with no terminator, conclude this build does
+		// not print one rather than never locking a codec baseline at all.
+		if rmLegible && complete && !strings.Contains(rm, "Events logs") {
+			noTermPolls++
+			noTerminator = noTermPolls >= 3
+		}
 		// A truncated transport is a fault the reconnect exists for, so it has to
 		// keep counting toward consecFailures rather than resetting it.
 		// A transport that truncates is the fault the reconnect exists for, so it
@@ -603,7 +610,7 @@ func waitForVideo(ctx context.Context, c *config) error {
 			// separately from this one, so a transient failure cannot make the
 			// outgoing channel's decoder look new -- and a permanent one cannot stop
 			// the session fallback from working.
-			if rmLegible && rmWhole(rm, ids) {
+			if rmLegible && rmWhole(rm, ids, noTerminator) {
 				haveCodecBase = true
 				baseIDs, baseSet = ids, setOf(ids)
 			}
@@ -632,16 +639,10 @@ func waitForVideo(ctx context.Context, c *config) error {
 		// No `continue`: falling through leaves the ids compared against a set that
 		// now contains them, so nothing fires, and the poll's arming and hits
 		// bookkeeping is not skipped.
-		// Two consecutive polls must agree before the codec baseline is locked.
 		// rmLegible cannot tell "I could not parse this dump" from "there was
-		// nothing to parse" -- both yield zero ids -- and a dumpsys that times out
-		// mid-dump still carries the "Processes:" header AND both probe markers.
-		// Installing an empty baseline from one of those makes the OUTGOING
-		// channel's decoder read as new, and the log is indistinguishable from a
-		// real detection. A transient truncation will not agree with the healthy
-		// poll after it; a genuinely idle box agrees with itself. Costs one poll,
-		// which MIN_WAIT covers.
-		if !haveCodecBase && rmLegible && complete && rmWhole(rm, ids) {
+		// nothing to parse" -- both yield zero ids -- so rmWhole decides it
+		// structurally, within the poll, rather than by comparing polls.
+		if !haveCodecBase && rmLegible && complete && rmWhole(rm, ids, noTerminator) {
 			haveCodecBase = true
 			baseIDs, baseSet = ids, setOf(ids)
 			if c.debug {
@@ -1447,8 +1448,19 @@ func sectionComplete(pl []byte) bool {
 // comparison was between two values that were empty by construction, so two
 // truncated dumps agreed trivially, and delaying the non-empty case let the
 // baseline swallow the new channel's decoder instead.
-func rmWhole(rm string, ids []string) bool {
-	return len(ids) > 0 || strings.Contains(rm, "Events logs")
+//
+// A dump that names decoders is trusted ONLY on a box that has never shown the
+// terminator, because transport truncation lands at an arbitrary byte and can
+// cut after decoder #1 -- leaving a partial list that looks parsed, so decoder
+// #2 reads as new and the gate opens on the channel being left. AOSP 11-16 all
+// emit "Events logs" after the process list, so on real hardware the strict rule
+// holds; the relaxation exists so a vendor build that omits it does not lose the
+// primary detector entirely.
+func rmWhole(rm string, ids []string, noTerminator bool) bool {
+	if strings.Contains(rm, "Events logs") {
+		return true
+	}
+	return noTerminator && len(ids) > 0
 }
 
 // sameSet reports whether two pid sets are equal.
@@ -1505,16 +1517,6 @@ func main() {
 	// nothing. Bytes received before the gate opens are discarded, never emitted.
 	go func() { streamErr <- stream(ctx, c, gate) }()
 
-	// streamErr holds exactly one value. Track whether we have taken it, because
-	// taking it twice blocks forever with no sender left and the process dies with
-	// a Go "all goroutines are asleep" fatal error instead of the log line below.
-	// Reachable whenever the encoder fails during detection and ON_TIMEOUT is not
-	// "fail" -- most ordinarily when READ_TIMEOUT (10s) expires inside a much
-	// longer TUNE_TIMEOUT (40s), which an HDMI resync on the channel change is
-	// enough to cause.
-	var streamResult error
-	haveResult := false
-
 	if c.tunerIP == "" {
 		logf(c, "TUNER%s_IP not set -- no gate", c.tuner)
 		close(gate)
@@ -1522,14 +1524,6 @@ func main() {
 		// Surface an encoder failure that already happened, rather than blaming
 		// the box. Without this the only log is "no playback after 40s" while the
 		// real fault was a dead encoder noticed 40 seconds ago.
-		select {
-		case se := <-streamErr:
-			streamResult, haveResult = se, true
-			if se != nil {
-				logf(c, "encoder failed during detection: %v", se)
-			}
-		default:
-		}
 		logf(c, "%v", err)
 		if c.onTimeout == "fail" {
 			logf(c, "failing the tune rather than streaming whatever is on screen")
@@ -1545,10 +1539,11 @@ func main() {
 		close(gate)
 	}
 
-	if !haveResult {
-		streamResult = <-streamErr
-	}
-	err = streamResult
+	// stream() cannot return before the gate opens -- it redials instead -- so
+	// there is exactly one value here and exactly one receive. The earlier
+	// non-blocking drain became unreachable when the redial loop landed, and the
+	// encoder failure it used to surface is now logged by the loop itself.
+	err = <-streamErr
 	switch {
 	case err == nil, ctx.Err() != nil:
 	case errors.Is(err, syscall.EPIPE), errors.Is(err, os.ErrClosed):

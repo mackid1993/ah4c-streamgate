@@ -322,7 +322,7 @@ func TestWaitForVideoSurvivesManyFailedProbes(t *testing.T) {
 // A transient binder failure on the resource half must not install an empty
 // CODEC baseline -- the outgoing channel's decoder would then read as new. The
 // codec baseline is taken separately, from the first legible resource dump.
-func TestWaitForVideoDefersTheCodecBaselinePastABinderBlip(t *testing.T) {
+func TestWaitForVideoRejectsAnIllegibleCodecBaseline(t *testing.T) {
 	hNewADB(t,
 		hStep{raw: "Can't find service: media.resource_manager\n__MS__\n" + hStopped + "\n__MS2__\n"},
 		hStep{ids: []string{"OLD"}, session: hStopped},

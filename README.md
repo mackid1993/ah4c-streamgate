@@ -64,7 +64,7 @@ This one has no identity, so it only counts once it has dropped at least once si
 
 Whichever fires must hold for `CONFIRM` consecutive polls.
 
-Both rest on the baseline being real, so the baseline is taken by the first poll that actually comes back — not by one unchecked call at startup. An empty dump makes every decoder look new and reads as "not playing", so a single failed probe (and the call right after `adb connect` is the likeliest one to fail) would otherwise open the gate immediately on the channel you're leaving. If the adb session drops mid-wait, streamgate reconnects rather than spending the rest of `TUNE_TIMEOUT` failing.
+Both rest on the baseline being real, so the timing baseline is taken by the first poll that actually comes back, and the codec baseline by the first one whose resource dump arrived whole — not by one unchecked call at startup. An empty dump makes every decoder look new and reads as "not playing", so a single failed probe (and the call right after `adb connect` is the likeliest one to fail) would otherwise open the gate immediately on the channel you're leaving. If the adb session drops mid-wait, streamgate reconnects rather than spending the rest of `TUNE_TIMEOUT` failing.
 
 ---
 
