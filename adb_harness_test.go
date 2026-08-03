@@ -339,19 +339,24 @@ func TestWaitForVideoAcceptsAnUnparseableBaseline(t *testing.T) {
 // The same hole reached by the other realistic route: adb hands back a
 // TRUNCATED dump, so the __MS__ marker never arrives, split() returns the whole
 // thing as the resource half (main.go:414) and nothing parses out of it.
-func TestWaitForVideoAcceptsATruncatedBaseline(t *testing.T) {
+// A dump cut off mid-write parses to no decoders at all, so accepting it as the
+// baseline makes the OUTGOING channel's decoder read as new on the very next
+// poll. The __MS__ marker is the discriminator: it is echoed between the two
+// halves, so its absence proves the probe never finished.
+func TestWaitForVideoRejectsATruncatedBaseline(t *testing.T) {
 	hNewADB(t,
-		hStep{raw: "Processes:\n  Pid: 4000\n    Id: OL"}, // cut mid-dump
+		hStep{raw: "Processes:\n  Pid: 4000\n    Id: OL"}, // cut mid-dump, no marker
 		hStep{ids: []string{"OLD"}, session: hStopped},
 	)
-	err, _, log := hWait(t, hConfig())
-	if err != nil {
-		t.Fatalf("waitForVideo: %v", err)
+	c := hConfig()
+	c.tuneTimeout = 900 * time.Millisecond
+	err, _, log := hWait(t, c)
+	if err == nil {
+		t.Fatalf("gate opened on the channel we were leaving; log:\n%s", log)
 	}
-	if !strings.Contains(log, "via codec OLD") {
-		t.Errorf("expected the gate to open on the pre-existing decoder, got:\n%s", log)
+	if strings.Contains(log, "via codec OLD") {
+		t.Errorf("a truncated dump became the baseline:\n%s", log)
 	}
-	t.Log("BUG main.go:480: a truncated dump became the baseline")
 }
 
 // BUG (main.go:486, main.go:506). `armed` is the guard that stops a session left
@@ -1360,5 +1365,46 @@ func TestMainGateOpensThenTheDVRHangsUp(t *testing.T) {
 	}
 	if !strings.Contains(se.String(), "closed by the DVR") {
 		t.Errorf("the DVR hanging up was not reported as a normal end:\n%s", se.String())
+	}
+}
+
+// A probe that COMPLETED with an empty session half means the box has no media
+// session at all -- genuinely not playing, so it must arm the fallback. A probe
+// that was cut SHORT means we know nothing, so it must not. Collapsing those two
+// left `armed` false forever whenever an app tears its MediaSession down while
+// retuning, and on a box with no usable resource-manager signal that fails every
+// tune outright.
+func TestSessionTornDownDuringChannelChangeStillArms(t *testing.T) {
+	hNewADB(t,
+		hStep{session: hPlaying},          // baseline: outgoing channel parked at 3
+		hStep{},                           // session released while retuning
+		hStep{},                           //
+		hStep{session: hPlaying, exit: 0}, // new channel genuinely playing
+		hStep{session: hPlaying},          //
+	)
+	c := hConfig()
+	c.tuneTimeout = 3 * time.Second
+	err, _, log := hWait(t, c)
+	if err != nil {
+		t.Fatalf("never armed, so the new channel never registered: %v\nlog:\n%s", err, log)
+	}
+	if !strings.Contains(log, "via session playing") {
+		t.Errorf("want the session fallback to have fired, got:\n%s", log)
+	}
+}
+
+// The same shape, but the probe is cut short rather than answering emptily: that
+// must NOT arm, or the outgoing channel's parked state=3 opens the gate.
+func TestCutShortSessionDoesNotArm(t *testing.T) {
+	hNewADB(t,
+		hStep{session: hPlaying},                          // baseline: parked at 3
+		hStep{raw: "Processes:\n  Pid: 4000\n    Id: OL"}, // truncated, no marker
+		hStep{session: hPlaying},                          // the SAME parked session
+	)
+	c := hConfig()
+	c.tuneTimeout = 900 * time.Millisecond
+	err, _, log := hWait(t, c)
+	if err == nil {
+		t.Fatalf("gate opened on a session that never dropped; log:\n%s", log)
 	}
 }

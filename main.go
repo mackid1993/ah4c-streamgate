@@ -421,11 +421,16 @@ func waitForVideo(ctx context.Context, c *config) error {
 	// One round trip per poll: the resource dump, a marker, then the top
 	// PlaybackState line.
 	const probe = "dumpsys media.resource_manager; echo __MS__; dumpsys media_session | grep -m1 PlaybackState || true"
-	split := func(out string) (string, string) {
+	// The marker is the discriminator. It is echoed unconditionally between the
+	// two halves, so seeing it proves the probe ran to completion -- and NOT
+	// seeing it proves the output was cut short, which `adb shell` exiting
+	// non-zero can no longer tell us on its own (a killed child and a grep that
+	// matched nothing both surface as an ExitError).
+	split := func(out string) (rm, ms string, complete bool) {
 		if i := strings.Index(out, "__MS__"); i >= 0 {
-			return out[:i], out[i+len("__MS__"):]
+			return out[:i], out[i+len("__MS__"):], true
 		}
-		return out, ""
+		return out, "", false
 	}
 
 	// The baseline has to come from a probe that actually succeeded, so it is
@@ -487,16 +492,23 @@ func waitForVideo(ctx context.Context, c *config) error {
 			continue
 		}
 		consecFailures = 0
-		rm, ms := split(raw)
+		rm, ms, complete := split(raw)
 		ids := secureCodecIDs(rm)
 		session := mediaSessionState(ms)
 
-		readable := strings.Contains(rm, "Processes:") || strings.Contains(ms, "PlaybackState")
+		// Three session states, not two. A probe that completed with an EMPTY
+		// session half means the box has no media session at all -- genuinely not
+		// playing, so it must arm. A probe that was cut short means we know
+		// nothing, so it must not. Collapsing those two was what let an app that
+		// tears its MediaSession down mid-retune leave `armed` false forever, and
+		// on a box with no usable resource-manager signal that fails every tune.
+		sessionRead := complete && (strings.TrimSpace(ms) == "" || strings.Contains(ms, "PlaybackState"))
 		if !haveBase {
-			if !readable {
-				// Not a usable baseline: adb answered, but neither signal was
-				// legible. Waiting costs a poll; accepting opens the gate on the
-				// channel we are leaving.
+			if !complete {
+				// Not a usable baseline: the probe was cut short, so the resource
+				// half may be a fragment that parses to no decoders at all -- and an
+				// empty baseline makes the outgoing channel's decoder read as new.
+				// Waiting costs a poll; accepting opens the gate on the old channel.
 				adbFailures++
 				time.Sleep(c.poll)
 				continue
@@ -506,7 +518,12 @@ func waitForVideo(ctx context.Context, c *config) error {
 			// The session has no identity, so it only counts once it has dropped at
 			// least once since we started -- otherwise a session left parked at
 			// state=3 by the previous channel reads as instant success.
-			armed = session != "playing"
+			//
+			// Same rule as the loop below, and it matters MORE here: this is the
+			// poll the whole tune is measured against. An unreadable session half
+			// used to arm it, and the next poll then opened the gate on the channel
+			// we were leaving.
+			armed = sessionRead && session != "playing"
 			if c.debug {
 				logf(c, "baseline codec=%s session=%s armed=%v (poll %d)",
 					orNone(strings.Join(baseIDs, ",")), session, armed, polls)
@@ -530,7 +547,7 @@ func waitForVideo(ctx context.Context, c *config) error {
 		// mediaSessionState cannot tell "stopped" from "could not be parsed", so a
 		// single truncated half used to arm the gate and let the previous
 		// channel's parked state=3 open it on the next poll.
-		if session != "playing" && strings.Contains(ms, "PlaybackState") {
+		if sessionRead && session != "playing" {
 			armed = true
 		}
 
@@ -1172,9 +1189,10 @@ func readPacket(br *bufio.Reader, pkt []byte, relaxed *bool, warn func()) error 
 		// Only when the evidence is ALREADY in the buffer. Peeking past what has
 		// arrived would block until the next packet does, which holds the current
 		// packet back every time the encoder pauses -- latency bought with nothing
-		// but a rarer check. bufio fills 8KB at a time, so in steady state the grid
-		// is confirmed on essentially every packet at zero cost, and at a stall the
-		// packet goes out immediately as it did before.
+		// but a rarer check. Measured: at one packet per write on a live stream the
+		// grid is almost never checked, and on 8KB chunks it is checked on ~97% of
+		// packets. That is the right way round -- the burst at connect is where a
+		// false lock would be established, and steady state pays nothing.
 		if !*relaxed && br.Buffered() >= tsPacketSize {
 			b, _ := br.Peek(tsPacketSize)
 			if b[tsPacketSize-1] != 0x47 {
