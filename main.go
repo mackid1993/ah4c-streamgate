@@ -475,8 +475,14 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 	}
 
 	br := bufio.NewReaderSize(resp.Body, 1<<20)
-	out := bufio.NewWriterSize(os.Stdout, 1<<18)
-	defer out.Flush()
+
+	// Write straight to stdout, unbuffered.
+	//
+	// A buffered writer here is a correctness bug, not an optimisation: it holds
+	// video back until the buffer fills, so the DVR receives bursts instead of a
+	// stream and buffers mid-playback. curl's -N exists for exactly this reason.
+	// Reads are still buffered -- that side costs nothing.
+	out := os.Stdout
 
 	var lastPAT, lastPMT []byte
 	pmtPids := map[uint16]bool{}
@@ -521,7 +527,6 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 		}
 
 		if err := readPacket(br, pkt); err != nil {
-			out.Flush()
 			return err
 		}
 
