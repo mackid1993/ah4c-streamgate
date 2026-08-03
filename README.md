@@ -1,4 +1,4 @@
-# ah4c-streamgate
+# ah4c-streamgatego
 
 A gate for [ah4c](https://github.com/sullrich/ah4c) that waits until your Android box is **actually playing video** before handing the encoder stream to your DVR.
 
