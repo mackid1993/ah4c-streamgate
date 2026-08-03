@@ -13,10 +13,12 @@
 //     mid-GOP fragment with no program tables and cannot decode until the next
 //     keyframe AND the next PSI cycle both arrive.
 //
-//  3. Never emit a byte from before the gate opened. It only ever discards
-//     forward. It is structurally incapable of introducing a channel-change
-//     banner, a tuning prompt, or a blue flash that curl would not also have
-//     delivered -- because everything it emits, curl would have emitted too.
+//  3. Never emit PICTURE from before the gate opened. It only ever discards
+//     forward. The one exception is the cached PAT/PMT injected at the head,
+//     which are by construction pre-gate packets -- they carry program tables,
+//     not video, so it remains structurally incapable of introducing a
+//     channel-change banner, a tuning prompt or a blue flash that curl would not
+//     also have delivered.
 //
 // stdout is the video stream. Nothing but stream bytes may ever be written
 // there; all logging goes to stderr.
@@ -1016,7 +1018,7 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) (wrote boo
 	motionStreak := 0
 	var motionAt time.Time
 	var motionRate, motionFloor float64
-	var gateAt time.Time
+	var gateAt, noVideoAt time.Time
 	draining := false
 	drained := 0
 	var readWait time.Duration
@@ -1038,6 +1040,16 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) (wrote boo
 				draining = c.drainIdle > 0
 				if !c.alignKey {
 					aligned = true
+					// The same reasoning as the ALIGN_TIMEOUT fallback: without this
+					// the DVR waits for the encoder's next PSI cycle, and the !wrote
+					// guard drops the stream's own leading tables on the way past --
+					// so this mode delivered strictly less than curl would.
+					if lastPAT != nil {
+						batch = append(batch, lastPAT...)
+					}
+					if lastPMT != nil {
+						batch = append(batch, lastPMT...)
+					}
 				}
 				// Opt-in. Everything measured before the gate came off a DIFFERENT
 				// picture -- usually the channel we are leaving -- so a rise seen
@@ -1333,6 +1345,19 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) (wrote boo
 		// Only evaluated until the first real packet: after that `wrote` is true
 		// and the map lookup would run on every packet for the whole recording.
 		if !wrote && (p == 0x1fff || p == 0 || pmtPids[p]) {
+			// Bounded. Suppressing padding until a real packet arrives is right, but
+			// nothing here made that wait finite: READ_TIMEOUT is idle-only, so an
+			// encoder muxing with no HDMI input keeps the deadline pushed out with
+			// nulls forever. The process then held a tuner slot indefinitely, with
+			// zero bytes, no log and no exit, while the DVR waited on a pipe that
+			// would never carry a byte. Failing loudly is strictly better.
+			if aligned && !noVideoAt.IsZero() && time.Since(noVideoAt) > c.readTimeout {
+				return wrote, fmt.Errorf("encoder sent only null padding and program tables for %v -- no picture (is anything connected to its HDMI input?)",
+					c.readTimeout)
+			}
+			if aligned && noVideoAt.IsZero() {
+				noVideoAt = time.Now()
+			}
 			continue
 		}
 		batch = append(batch, pkt...)
@@ -1357,10 +1382,12 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) (wrote boo
 // is spliced. Require the next sync byte to land exactly one packet later before
 // accepting the lock.
 //
-// That is also what makes a body that is not MPEG-TS at all fail loudly instead
-// of quietly: an HTML error page or a 204-byte DVB stream has no 188-byte sync
-// grid, so it never locks and the tune fails, rather than shovelling text at the
-// DVR as though it were video.
+// It also makes a body that is not MPEG-TS mostly fail loudly rather than
+// quietly -- an HTML error page has no 188-byte sync grid and emits nothing.
+// "Mostly", not "always": syncScanLimit below relaxes after 4096 rejected bytes
+// so a source with no grid still produces output rather than nothing, and a
+// binary body with roughly 1-in-256 sync-byte density can get past that. The
+// no-picture bound in the loop is what stops it running forever.
 // It never makes the stream WORSE than accepting a bare sync byte, which is the
 // whole reason for syncScanLimit: if a source genuinely has no 188-byte grid,
 // insisting on one would emit nothing at all. After that many rejected
