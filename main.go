@@ -415,6 +415,10 @@ func waitForVideo(ctx context.Context, c *config) error {
 				lastConnect = time.Now()
 				connect()
 			}
+			// CONFIRM counts CONSECUTIVE sightings, so a poll that told us nothing
+			// breaks the run. Skipping this would let a sighting from before an adb
+			// failure combine with one after it to satisfy CONFIRM across a gap.
+			hits = 0
 			time.Sleep(c.poll)
 			continue
 		}
@@ -798,16 +802,22 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 			readStart = time.Now()
 		}
 		if err := readPacket(br, pkt); err != nil {
-			// Report a failed final flush instead of the read error. If the DVR hung
-			// up, that is the real reason we are here and main treats it as the
-			// normal end of a recording; blaming the encoder logged a false failure.
-			if ferr := flush(); ferr != nil {
-				return ferr
-			}
+			ferr := flush()
 			// An encoder with no input can answer 200 with an empty body. Treating
 			// that as a clean EOF exited 0 having sent the DVR nothing at all.
+			//
+			// This has to outrank the flush error below. A flush of the cached tables
+			// can fail with EPIPE, which main reads as the normal end of a recording
+			// and exits 0 -- so checking the flush first could report a tune that sent
+			// no video as a success.
 			if !wrote {
 				return fmt.Errorf("encoder sent no video (%v)", err)
+			}
+			// Prefer a failed final flush to the read error: if the DVR hung up, that
+			// is the real reason we are here and main treats it as the normal end of
+			// a recording, where blaming the encoder logged a false failure.
+			if ferr != nil {
+				return ferr
 			}
 			// The encoder ending the stream mid-recording is a failure however
 			// politely it closes. Reporting io.EOF as success truncated recordings

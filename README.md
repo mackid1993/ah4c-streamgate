@@ -189,7 +189,7 @@ What each number means:
 | `via codec … (base …)` | which signal fired. `base` is what was allocated before tuning — a *changed* id is the proof of new playback. |
 | `video-pid` | the PID carrying the keyframe the stream started on. |
 | `discarded` | bytes dropped between the gate opening and that keyframe. These would have been undecodable to your DVR anyway. |
-| `caught-up` | bytes thrown away by `DRAIN_IDLE` to get back to live. Usually `0KB` — streamgate reads the encoder continuously while it waits, so there is rarely a backlog to clear. |
+| `caught-up` | bytes thrown away by `DRAIN_IDLE` to get back to live. Normally a KB or two — streamgate reads the encoder continuously while it waits, so there is rarely much of a backlog to clear. A large number here means your encoder buffers, and `DRAIN_IDLE` is earning its keep. |
 | `gate-to-air` | **the number to watch.** Total time from the gate opening to the first byte sent. |
 | `waited-for-motion` | how much of `gate-to-air` was spent waiting for the picture to start moving. Small means the tune cost nothing extra; a second or more means it genuinely held through a loading screen. |
 | `picture` / `still-picture-floor` | current data rate versus the quietest the stream has been. The floor is the app's loading screen; the ratio between them is what triggers release. |
