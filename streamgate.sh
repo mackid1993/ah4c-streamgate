@@ -19,15 +19,16 @@ TUNE_TIMEOUT=${TUNE_TIMEOUT:-40} # give up and stream anyway after this. Costs
                                  # returns the moment it detects -- so this only
                                  # governs how long a cold box gets before you
                                  # end up watching its splash screen.
-SETTLE=${SETTLE:-0.25}           # pause after detecting, before handing off
-CONFIRM=${CONFIRM:-3}            # consecutive polls that must agree before handing
+SETTLE=${SETTLE:-0}           # pause after detecting, before handing off
+CONFIRM=${CONFIRM:-1}            # consecutive polls that must agree before handing
                                  # off. A deeplink into an already-running app
                                  # switches channels in place -- "Activity not
                                  # started, intent delivered to currently running
                                  # top-most instance" -- so the new decoder is
                                  # allocated a beat before anything is decoded.
                                  # One sighting is not playback.
-POLL=${POLL:-0.25}
+POLL=${POLL:-0.05}
+CONFIRM_POLL=${CONFIRM_POLL:-0.05}
 BLACK_CHECK=${BLACK_CHECK:-auto} # auto | 1 | 0 -- see the note below
 BLACK_AFTER=${BLACK_AFTER:-6}    # in auto, only start sampling after this many seconds
 BLACK_PCT=${BLACK_PCT:-100}      # pblack is an integer; 100 is the >99.8 rule
@@ -198,7 +199,11 @@ waitForVideo() {
             via_black=
         fi
 
-        sleep "$POLL"
+        if [ "$hits" -gt 0 ]; then
+            sleep "$CONFIRM_POLL"
+        else
+            sleep "$POLL"
+        fi
     done
 }
 
