@@ -292,6 +292,12 @@ func secureCodecIDs(dump string) []string {
 			}
 			continue
 		}
+		// A new process block clears the previous block's id, so a secure codec
+		// listed without one of its own is not attributed to the process above it.
+		if strings.HasPrefix(t, "Pid:") {
+			id = ""
+			continue
+		}
 		if m := reID.FindStringSubmatch(line); m != nil {
 			id = m[1]
 			continue
@@ -373,8 +379,16 @@ func adbShell(ctx context.Context, ip, cmd string, budget time.Duration) string 
 	ec := exec.CommandContext(c, "adb", "-s", ip, "shell", cmd)
 	ec.WaitDelay = 2 * time.Second
 	out, err := ec.Output()
+	// Keep output that already arrived even when adb exits non-zero. Under shell
+	// protocol v2 adb propagates the REMOTE exit status, and the probe ends in a
+	// grep that exits 1 when it matches nothing -- so on a box with no media
+	// session the resource dump in the same breath was thrown away, every poll
+	// was filed as an adb failure, and the primary signal never ran at all.
 	if err != nil {
-		return ""
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) || len(out) == 0 {
+			return ""
+		}
 	}
 	return strings.ReplaceAll(string(out), "\r", "")
 }
@@ -406,7 +420,7 @@ func waitForVideo(ctx context.Context, c *config) error {
 
 	// One round trip per poll: the resource dump, a marker, then the top
 	// PlaybackState line.
-	const probe = "dumpsys media.resource_manager; echo __MS__; dumpsys media_session | grep -m1 PlaybackState"
+	const probe = "dumpsys media.resource_manager; echo __MS__; dumpsys media_session | grep -m1 PlaybackState || true"
 	split := func(out string) (string, string) {
 		if i := strings.Index(out, "__MS__"); i >= 0 {
 			return out[:i], out[i+len("__MS__"):]
@@ -477,7 +491,16 @@ func waitForVideo(ctx context.Context, c *config) error {
 		ids := secureCodecIDs(rm)
 		session := mediaSessionState(ms)
 
+		readable := strings.Contains(rm, "Processes:") || strings.Contains(ms, "PlaybackState")
 		if !haveBase {
+			if !readable {
+				// Not a usable baseline: adb answered, but neither signal was
+				// legible. Waiting costs a poll; accepting opens the gate on the
+				// channel we are leaving.
+				adbFailures++
+				time.Sleep(c.poll)
+				continue
+			}
 			haveBase = true
 			baseIDs, baseSet = ids, setOf(ids)
 			// The session has no identity, so it only counts once it has dropped at
@@ -503,7 +526,11 @@ func waitForVideo(ctx context.Context, c *config) error {
 		case session == "playing" && armed:
 			playing, via = true, "session playing"
 		}
-		if session != "playing" {
+		// Only a session we could actually read may arm the fallback.
+		// mediaSessionState cannot tell "stopped" from "could not be parsed", so a
+		// single truncated half used to arm the gate and let the previous
+		// channel's parked state=3 open it on the next poll.
+		if session != "playing" && strings.Contains(ms, "PlaybackState") {
 			armed = true
 		}
 
@@ -635,7 +662,11 @@ func videoPIDs(payload []byte) map[uint16]bool {
 		st := payload[i]
 		epid := uint16(payload[i+1]&0x1f)<<8 | uint16(payload[i+2])
 		esLen := int(uint16(payload[i+3]&0x0f)<<8 | uint16(payload[i+4]))
-		if st == 0x01 || st == 0x02 || st == 0x1b || st == 0x24 {
+		// 0x01/0x02 MPEG-2, 0x1b H.264, 0x24 HEVC, 0x27 HEVC temporal sub-layer,
+		// 0x33 VVC, 0xea VC-1. An unrecognised type leaves vidPids empty, and
+		// alignment then falls back to any random access point -- which lands on
+		// the audio pid and starts the recording mid-GOP.
+		if st == 0x01 || st == 0x02 || st == 0x1b || st == 0x24 || st == 0x27 || st == 0x33 || st == 0xea {
 			out[epid] = true
 		}
 		i += 5 + esLen
@@ -791,6 +822,7 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 	var lastPAT, lastPMT []byte
 	pmtPids := map[uint16]bool{}
 	vidPids := map[uint16]bool{}
+	vidByPMT := map[uint16]map[uint16]bool{}
 
 	open := false
 	aligned := false
@@ -808,6 +840,14 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 	draining := false
 	drained := 0
 	var readWait time.Duration
+	relaxedSync := false
+	warnedSync := false
+	warnSync := func() {
+		if !warnedSync {
+			warnedSync = true
+			logf(c, "no 188-byte sync grid in this stream; accepting bare sync bytes (is the encoder emitting MPEG-TS?)")
+		}
+	}
 
 	for {
 		if !open {
@@ -858,7 +898,7 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 		if draining {
 			readStart = time.Now()
 		}
-		if err := readPacket(br, pkt); err != nil {
+		if err := readPacket(br, pkt, &relaxedSync, warnSync); err != nil {
 			// An encoder with no input can answer 200 with an empty body. Treating
 			// that as a clean EOF exited 0 having sent the DVR nothing at all.
 			//
@@ -895,20 +935,40 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 		// and the len(m) > 0 guard below does not filter garbage, so that garbage
 		// replaced the real PMT PID and stopped the tables updating. Caching one
 		// would also inject a mid-section fragment as the DVR's first table.
-		if psiStart := pkt[1]&0x40 != 0; p == 0 {
-			if psiStart {
+		if p == 0 {
+			if pl := psiPayload(pkt, 0x00); pl != nil && sectionComplete(pl) {
 				lastPAT = append(lastPAT[:0], pkt...)
-				if pl := payload(pkt, true); pl != nil {
-					if m := pmtPIDs(pl); len(m) > 0 {
-						pmtPids = m
+				if m := pmtPIDs(pl); len(m) > 0 {
+					// A PAT that renames the programmes invalidates everything
+					// learned from the old ones -- otherwise the injected PAT points
+					// at one PMT pid while the injected PMT sits on another, and the
+					// DVR discards the pair.
+					if !sameSet(m, pmtPids) {
+						lastPMT = lastPMT[:0]
+						vidByPMT = map[uint16]map[uint16]bool{}
+						vidPids = map[uint16]bool{}
 					}
+					pmtPids = m
 				}
 			}
-		} else if pmtPids[p] && psiStart {
-			lastPMT = append(lastPMT[:0], pkt...)
-			if pl := payload(pkt, true); pl != nil {
-				if m := videoPIDs(pl); len(m) > 0 {
-					vidPids = m
+		} else if pmtPids[p] {
+			if pl := psiPayload(pkt, 0x02); pl != nil && sectionComplete(pl) {
+				v := videoPIDs(pl)
+				vidByPMT[p] = v
+				// Union, not replace. With two programmes in the PAT the last PMT
+				// parsed used to win outright, so a programme whose video pid is
+				// never muxed could hold alignment off for the whole ALIGN_TIMEOUT
+				// -- ten seconds of dead recording at the shipped default.
+				vidPids = map[uint16]bool{}
+				for _, set := range vidByPMT {
+					for id := range set {
+						vidPids[id] = true
+					}
+				}
+				// Inject a PMT that actually declares video, not merely the most
+				// recent one seen.
+				if len(v) > 0 {
+					lastPMT = append(lastPMT[:0], pkt...)
 				}
 			}
 		}
@@ -1005,7 +1065,7 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 			// If no PMT was seen, or it lists stream types this does not know,
 			// take any random access point rather than discarding indefinitely --
 			// a slightly worse start beats no picture on unfamiliar hardware.
-			if !(randomAccess(pkt) && (vidPids[p] || len(vidPids) == 0)) {
+			if !alignCandidate(pkt, p, vidPids, pmtPids) {
 				discarded++
 				continue
 			}
@@ -1058,7 +1118,12 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 		}
 
 		batch = append(batch, pkt...)
-		wrote = true
+		// Null padding and the tables are not a picture. An encoder that is muxing
+		// with no HDMI input emits nothing but those, and counting them recorded
+		// 91% stuffing and reported the tune a success.
+		if p != 0x1fff && p != 0 && !pmtPids[p] {
+			wrote = true
+		}
 		// Flush as soon as nothing more has already arrived, or the batch is full.
 		// Never waits for data -- latency matches a per-packet write, at a fraction
 		// of the syscalls.
@@ -1071,19 +1136,117 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 }
 
 // readPacket reads one 188-byte TS packet, resynchronising on 0x47 if needed.
-func readPacket(br *bufio.Reader, pkt []byte) error {
+//
+// A lone 0x47 is not enough to lock on. Sync bytes occur constantly inside video
+// payload, and accepting one puts every later packet 1..187 bytes out of phase
+// for the rest of the recording -- with the byte COUNT unchanged, so a length
+// check and an "every 188th byte is 0x47" check both still pass while the video
+// is spliced. Require the next sync byte to land exactly one packet later before
+// accepting the lock.
+//
+// That is also what makes a body that is not MPEG-TS at all fail loudly instead
+// of quietly: an HTML error page or a 204-byte DVB stream has no 188-byte sync
+// grid, so it never locks and the tune fails, rather than shovelling text at the
+// DVR as though it were video.
+// It never makes the stream WORSE than accepting a bare sync byte, which is the
+// whole reason for syncScanLimit: if a source genuinely has no 188-byte grid,
+// insisting on one would emit nothing at all. After that many rejected
+// candidates it takes the next bare 0x47, exactly as before, so the worst case
+// is what shipped previously plus one log line saying so.
+const syncScanLimit = 4096
+
+func readPacket(br *bufio.Reader, pkt []byte, relaxed *bool, warn func()) error {
+	scanned := 0
 	for {
 		if _, err := io.ReadFull(br, pkt[:1]); err != nil {
 			return err
 		}
 		if pkt[0] != 0x47 {
+			scanned++
 			continue
+		}
+		// Peek covers the rest of this packet plus the next packet's sync byte,
+		// which sits at index tsPacketSize-1 of the peeked window. A short peek
+		// means the stream is ending and there is no grid left to confirm --
+		// accept, so a clean final packet is not thrown away.
+		// Only when the evidence is ALREADY in the buffer. Peeking past what has
+		// arrived would block until the next packet does, which holds the current
+		// packet back every time the encoder pauses -- latency bought with nothing
+		// but a rarer check. bufio fills 8KB at a time, so in steady state the grid
+		// is confirmed on essentially every packet at zero cost, and at a stall the
+		// packet goes out immediately as it did before.
+		if !*relaxed && br.Buffered() >= tsPacketSize {
+			b, _ := br.Peek(tsPacketSize)
+			if b[tsPacketSize-1] != 0x47 {
+				scanned++
+				if scanned > syncScanLimit {
+					*relaxed = true
+					warn()
+				}
+				continue
+			}
 		}
 		if _, err := io.ReadFull(br, pkt[1:]); err != nil {
 			return err
 		}
 		return nil
 	}
+}
+
+// psiPayload returns the section payload of a PSI packet, but only if the packet
+// is worth believing: error indicator clear, a section start, the table id this
+// pid is supposed to carry, and the syntax indicator set.
+//
+// None of that was checked. One glitched packet on pid 0 therefore became the PAT
+// injected into the DVR, and the 25 nonsense program pids it parsed to replaced
+// the real PMT pid -- so every later PMT was ignored and table tracking stayed
+// frozen until the next good PAT arrived.
+func psiPayload(pkt []byte, wantTable byte) []byte {
+	if pkt[1]&0x80 != 0 { // transport_error_indicator
+		return nil
+	}
+	if pkt[1]&0x40 == 0 { // not a section start
+		return nil
+	}
+	pl := payload(pkt, true)
+	if len(pl) < 4 || pl[0] != wantTable || pl[1]&0x80 == 0 {
+		return nil
+	}
+	return pl
+}
+
+// sectionComplete reports whether the whole section fits in this one packet.
+// A section that spans packets cannot be injected from a single cached packet --
+// the DVR would get a fragment it can never reach the CRC of.
+func sectionComplete(pl []byte) bool {
+	return 3+(int(pl[1]&0x0f)<<8|int(pl[2])) <= len(pl)
+}
+
+// sameSet reports whether two pid sets are equal.
+func sameSet(a, b map[uint16]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if !b[k] {
+			return false
+		}
+	}
+	return true
+}
+
+// alignCandidate reports whether this packet may start the output. Null padding,
+// the program tables and packets with no payload at all are never a picture, but
+// each of them can carry a random access indicator -- and each was seen winning
+// alignment, producing a recording that opens on pid 8191 or on zero bytes.
+func alignCandidate(pkt []byte, p uint16, vidPids, pmtPids map[uint16]bool) bool {
+	if !randomAccess(pkt) || p == 0x1fff || p == 0 || pmtPids[p] {
+		return false
+	}
+	if payload(pkt, false) == nil {
+		return false
+	}
+	return vidPids[p] || len(vidPids) == 0
 }
 
 func main() {
