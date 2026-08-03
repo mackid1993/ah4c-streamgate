@@ -1,0 +1,89 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  # Run it by hand from the Actions tab. Leave release_tag empty to just build
+  # and get binaries as artifacts; set it (e.g. v0.1.0) to also cut a release.
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Tag to publish a release as (leave empty to only build)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+      - name: vet
+        run: go vet ./...
+      - name: build
+        run: go build ./...
+
+  release:
+    needs: check
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: arm
+            goarm: '7'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      # CGO off so the binary is static and runs in any container, including
+      # the ah4c image, without pulling in a libc dependency.
+      - name: build
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        run: |
+          NAME="streamgate-${GOOS}-${GOARCH}${GOARM:+v$GOARM}"
+          go build -trimpath -ldflags "-s -w" -o "$NAME" .
+          sha256sum "$NAME" | tee "$NAME.sha256"
+          file "$NAME" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: streamgate-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm }}
+          path: |
+            streamgate-*
+          if-no-files-found: error
+
+      - name: attach to release (tag push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            streamgate-*
+          generate_release_notes: true
+
+      - name: attach to release (manual run)
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          files: |
+            streamgate-*
+          generate_release_notes: true
