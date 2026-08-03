@@ -474,6 +474,8 @@ func waitForVideo(ctx context.Context, c *config) error {
 	hits := 0
 	adbFailures, polls, consecFailures, illegible := 0, 0, 0, 0
 	sawPlaying := false
+	var lastIDs []string
+	var lastSession, baseSession string
 	for {
 		elapsed := time.Since(start)
 		if elapsed >= c.tuneTimeout {
@@ -508,8 +510,11 @@ func waitForVideo(ctx context.Context, c *config) error {
 					elapsed.Round(time.Millisecond), polls-adbFailures, polls,
 					orNone(strings.Join(baseIDs, ",")), c.confirm, c.minWait)
 			}
-			return fmt.Errorf("no playback after %v (adb ok on %d/%d polls, base=%s) -- device reported no secure decoder and no playing media session",
-				elapsed.Round(time.Millisecond), polls-adbFailures, polls, orNone(strings.Join(baseIDs, ",")))
+			return fmt.Errorf("no playback after %v (adb ok on %d/%d polls) -- nothing changed: baseline codec=%s session=%s, last poll codec=%s session=%s%s",
+				elapsed.Round(time.Millisecond), polls-adbFailures, polls,
+				orNone(strings.Join(baseIDs, ",")), orNone(baseSession),
+				orNone(strings.Join(lastIDs, ",")), orNone(lastSession),
+				map[bool]string{true: " (the session never dropped, so it could not be trusted as new)", false: ""}[!armed])
 		}
 		polls++
 
@@ -598,6 +603,7 @@ func waitForVideo(ctx context.Context, c *config) error {
 			// used to arm it, and the next poll then opened the gate on the channel
 			// we were leaving.
 			armed = sessionRead && session != "playing"
+			baseSession = session
 			if c.debug {
 				logf(c, "baseline codec=%s session=%s armed=%v (poll %d)",
 					orNone(strings.Join(baseIDs, ",")), session, armed, polls)
@@ -606,14 +612,19 @@ func waitForVideo(ctx context.Context, c *config) error {
 			continue
 		}
 
-		if !haveCodecBase && rmLegible {
+		// `complete` as well as legible, the same rule the first-poll baseline
+		// applies. A probe cut short mid-dump still carries the "Processes:"
+		// header, so it reads as legible while listing fewer decoders than the box
+		// has -- and every omitted id then reads as new on the next healthy poll.
+		// No `continue`: falling through leaves the ids compared against a set that
+		// now contains them, so nothing fires, and the poll's arming and hits
+		// bookkeeping is not skipped.
+		if !haveCodecBase && rmLegible && complete {
 			haveCodecBase = true
 			baseIDs, baseSet = ids, setOf(ids)
 			if c.debug {
 				logf(c, "codec baseline deferred to poll %d: %s", polls, orNone(strings.Join(baseIDs, ",")))
 			}
-			time.Sleep(c.poll)
-			continue
 		}
 
 		// A decoder we did not start with is proof of new playback and needs no
@@ -641,6 +652,7 @@ func waitForVideo(ctx context.Context, c *config) error {
 				orNone(strings.Join(baseIDs, ",")), session, armed, hits, playing)
 		}
 
+		lastIDs, lastSession = ids, session
 		if playing {
 			sawPlaying = true
 		}
@@ -849,7 +861,38 @@ func (c *idleTimeoutConn) Read(b []byte) (int, error) {
 //
 // It never emits anything received before `gate` fires. Everything it writes,
 // curl would also have written -- it only ever skips forward.
+// stream keeps trying to reach the encoder until the gate opens. Once it has,
+// the connection is the recording and a failure is terminal.
+//
+// The connection is opened at t=0, so it is live for the whole detection wait --
+// up to TUNE_TIMEOUT, 40s by default. Anything that interrupts it in that window
+// used to kill the tune outright with zero bytes, even though playback was then
+// detected and the encoder was healthy again. READ_TIMEOUT is 10s inside that
+// 40s, and an HDMI resync on the channel change is enough to trip it. Nothing is
+// lost by redialling: before the gate every byte is discarded anyway.
 func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
+	for attempt := 1; ; attempt++ {
+		err := streamOnce(ctx, c, gate)
+		select {
+		case <-gate:
+			return err // the gate is open: this was the recording
+		default:
+		}
+		if ctx.Err() != nil {
+			return err
+		}
+		logf(c, "encoder unavailable before the gate opened (attempt %d: %v); redialling", attempt, err)
+		select {
+		case <-gate:
+			return err
+		case <-ctx.Done():
+			return err
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", c.encoderURL, nil)
 	if err != nil {
 		return err
@@ -973,7 +1016,11 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 				// pays the whole MOTION_TIMEOUT.
 				if c.rearmMotion {
 					motionSeen, motionStreak = false, 0
+					// floor1/floor2 too, or the next window restores the pre-gate
+					// floor from them and `floorRate = -1` is a no-op -- which made
+					// REARM_MOTION do nothing at all to the thing it exists to reset.
 					floorRate = -1
+					floor1, floor2 = math.MaxFloat64, math.MaxFloat64
 					winBytes, winStart = 0, gateAt
 				}
 			default:

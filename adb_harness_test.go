@@ -553,7 +553,7 @@ func TestWaitForVideoCodecSignals(t *testing.T) {
 // signals are dead and the tune burns the entire TUNE_TIMEOUT. The diagnostic
 // then states, of a device that reported state=3 speed=1 on every single poll,
 // that it "reported no secure decoder and no playing media session".
-func TestWaitForVideoBaselineAbsorbsPlaybackAndThenLiesAboutIt(t *testing.T) {
+func TestWaitForVideoTimeoutNamesWhatItActuallySaw(t *testing.T) {
 	hNewADB(t,
 		hStep{fail: true}, // playback starts during this window
 		hStep{ids: []string{"OLD", "NEW"}, session: hPlaying},
@@ -564,14 +564,19 @@ func TestWaitForVideoBaselineAbsorbsPlaybackAndThenLiesAboutIt(t *testing.T) {
 	if err == nil {
 		t.Fatal("gate opened -- the bug appears to be fixed, flip this assertion")
 	}
-	if !strings.Contains(err.Error(), "no secure decoder and no playing media session") {
-		t.Fatalf("diagnostic = %q", err)
+	// The tune still fails -- nothing about the box ever changed, so there was
+	// nothing to detect. What must not happen is the message claiming the device
+	// reported no decoder and no playing session, when it reported both on every
+	// poll. It has to say what it actually saw.
+	m := err.Error()
+	for _, want := range []string{"nothing changed", "baseline codec=OLD,NEW", "last poll codec=OLD,NEW", "session=playing"} {
+		if !strings.Contains(m, want) {
+			t.Errorf("diagnostic = %q, want it to mention %q", m, want)
+		}
 	}
-	if !strings.Contains(err.Error(), "base=OLD,NEW") {
-		t.Errorf("diagnostic = %q, want the absorbed decoder named in base=", err)
+	if strings.Contains(m, "no secure decoder") {
+		t.Errorf("diagnostic still claims no decoder, of a box that reported one every poll: %q", m)
 	}
-	t.Logf("BUG main.go:451: every poll reported state=3 speed=1 and a decoder, "+
-		"and the tune failed with %q", err)
 }
 
 // -------------------------------------------------- the session fallback
@@ -740,11 +745,11 @@ func TestWaitForVideoTimeoutDiagnostics(t *testing.T) {
 		c := hConfig()
 		c.tuneTimeout = 500 * time.Millisecond
 		err, _, _ := hWait(t, c)
-		if err == nil || !strings.Contains(err.Error(), "no secure decoder and no playing media session") {
-			t.Fatalf("diagnostic = %v, want the not-playing message", err)
+		if err == nil || !strings.Contains(err.Error(), "nothing changed") {
+			t.Fatalf("diagnostic = %v, want the nothing-changed message", err)
 		}
-		if !strings.Contains(err.Error(), "base=A") {
-			t.Errorf("diagnostic = %q, want base=A", err)
+		if !strings.Contains(err.Error(), "baseline codec=A") {
+			t.Errorf("diagnostic = %q, want baseline codec=A", err)
 		}
 	})
 
@@ -764,14 +769,18 @@ func TestWaitForVideoTimeoutDiagnostics(t *testing.T) {
 		if err == nil {
 			t.Fatal("want a timeout")
 		}
-		if !strings.Contains(err.Error(), "no secure decoder and no playing media session") {
-			t.Fatalf("diagnostic = %q", err)
+		// adb was dead for every poll but the first, so the message must not blame
+		// the device -- it has to show that the last poll returned nothing at all.
+		m := err.Error()
+		if !strings.Contains(m, "adb ok on 1/") {
+			t.Errorf("diagnostic = %q, want the 1-of-N poll count", m)
 		}
-		if !strings.Contains(err.Error(), "adb ok on 1/") {
-			t.Errorf("diagnostic = %q, want the 1-of-N poll count", err)
+		if !strings.Contains(m, "last poll codec=none session=none") {
+			t.Errorf("diagnostic = %q, want the last poll shown as having returned nothing", m)
 		}
-		t.Logf("BUG main.go:451: adb was dead for every poll but the first, and "+
-			"the message blames the device: %q", err)
+		if strings.Contains(m, "no secure decoder") {
+			t.Errorf("diagnostic still blames the device: %q", m)
+		}
 	})
 
 	// A probe that never answers, rather than one that fails fast.
@@ -1210,9 +1219,11 @@ func TestMainEncoderFailures(t *testing.T) {
 	}
 }
 
-// The encoder dies while detection is still running. main must report the
-// encoder, not the box -- the whole reason streamErr is drained before the
-// timeout is logged.
+// The encoder dies while detection is still running. Before the gate opens that
+// is recoverable -- every byte is being discarded anyway -- so streamgate
+// redials rather than latching the failure and killing a tune whose box then
+// comes up fine. It must still say the encoder was the problem, and it must
+// still put zero bytes on the wire when detection then times out.
 func TestMainEncoderDiesDuringDetection(t *testing.T) {
 	for _, onTimeout := range []string{"fail", "stream"} {
 		t.Run("ON_TIMEOUT="+onTimeout, func(t *testing.T) {
@@ -1232,8 +1243,8 @@ func TestMainEncoderDiesDuringDetection(t *testing.T) {
 			if !strings.Contains(res.stderr, "encoder") {
 				t.Errorf("stderr never mentions the encoder:\n%s", res.stderr)
 			}
-			if onTimeout == "fail" && !strings.Contains(res.stderr, "encoder failed during detection") {
-				t.Errorf("stderr = %s", res.stderr)
+			if !strings.Contains(res.stderr, "redialling") {
+				t.Errorf("encoder failure before the gate was latched instead of retried:\n%s", res.stderr)
 			}
 		})
 	}
