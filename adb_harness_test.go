@@ -319,24 +319,46 @@ func TestWaitForVideoSurvivesManyFailedProbes(t *testing.T) {
 // Pinned as it behaves today so the suite stays green against unmodified
 // main.go. WANT: a dump that yields no ids AND no session must not be accepted
 // as a baseline.
-func TestWaitForVideoAcceptsAnUnparseableBaseline(t *testing.T) {
-	a := hNewADB(t,
-		// dumpsys is missing/failed, the marker and the grep still print.
+// A transient binder failure on the resource half must not install an empty
+// CODEC baseline -- the outgoing channel's decoder would then read as new. The
+// codec baseline is taken separately, from the first legible resource dump.
+func TestWaitForVideoDefersTheCodecBaselinePastABinderBlip(t *testing.T) {
+	hNewADB(t,
 		hStep{raw: "Can't find service: media.resource_manager\n__MS__\n" + hStopped + "\n__MS2__\n"},
 		hStep{ids: []string{"OLD"}, session: hStopped},
+		hStep{ids: []string{"OLD"}, session: hStopped},
 	)
-	err, _, log := hWait(t, hConfig())
+	c := hConfig()
+	c.tuneTimeout = 900 * time.Millisecond
+	err, _, log := hWait(t, c)
+	if err == nil {
+		t.Fatalf("gate opened on the outgoing channel's decoder; log:\n%s", log)
+	}
+	if strings.Contains(log, "via codec OLD") {
+		t.Errorf("an empty baseline made a pre-existing decoder look new:\n%s", log)
+	}
+}
+
+// ...and the opposite pull: a box that has NO resource manager at all must still
+// tune on the session fallback. Requiring a legible resource dump for the
+// baseline failed every tune on exactly the device class the fallback exists for.
+func TestWaitForVideoTunesWithNoResourceManagerAtAll(t *testing.T) {
+	none := "Can't find service: media.resource_manager\n__MS__\n"
+	hNewADB(t,
+		hStep{raw: none + "__MS2__\n"},              // no session published yet
+		hStep{raw: none + "__MS2__\n"},              //
+		hStep{raw: none + hPlaying + "\n__MS2__\n"}, // new channel comes up playing
+		hStep{raw: none + hPlaying + "\n__MS2__\n"},
+	)
+	c := hConfig()
+	c.tuneTimeout = 3 * time.Second
+	err, _, log := hWait(t, c)
 	if err != nil {
-		t.Fatalf("waitForVideo: %v", err)
+		t.Fatalf("no tune is possible on a box without a resource manager: %v\nlog:\n%s", err, log)
 	}
-	if !strings.Contains(log, "via codec OLD") {
-		t.Errorf("expected the documented-as-fixed failure, got:\n%s", log)
+	if !strings.Contains(log, "via session playing") {
+		t.Errorf("want the session fallback, got:\n%s", log)
 	}
-	if got := a.calls("shell"); got != 2 {
-		t.Errorf("%d probes, want 2", got)
-	}
-	t.Log("BUG main.go:480: an unparseable dump became the baseline and the gate " +
-		"opened on the previous channel's decoder at the second poll")
 }
 
 // The same hole reached by the other realistic route: adb hands back a

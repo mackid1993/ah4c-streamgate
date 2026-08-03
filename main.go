@@ -49,9 +49,11 @@ const (
 	maxDrain = 20000 // ~3.7MB, a stop so a bursting encoder cannot spin
 
 	tsPacketSize = 188
-	// Below this a measurement window is a gap in the stream, not a picture.
-	// 8 packets in a 250ms window is 48 kbit/s -- far under any real still frame,
-	// far over the one or two packets a stall leaves behind.
+	// Below this a measurement window is a gap in the stream, not a picture. 8
+	// packets is 48 kbit/s over a full 250ms window, 24 kbit/s over the 2x-length
+	// window the guard still permits -- under any real still frame either way. It
+	// is a floor on absurdity, not the whole defence; the two-lowest rule above
+	// is what actually stops one artifact becoming the floor.
 	minWindowPackets = 8
 	// However DRAIN_IDLE is set, catching up is a handoff cost, not a phase of
 	// the recording. Without this a DRAIN_IDLE larger than the socket read
@@ -464,6 +466,7 @@ func waitForVideo(ctx context.Context, c *config) error {
 	// the old channel still on screen. Same for the session: an empty dump reads
 	// as "not playing", which armed the fallback instantly.
 	haveBase := false
+	haveCodecBase := false
 	var baseIDs []string
 	var baseSet map[string]bool
 	armed := false
@@ -482,16 +485,16 @@ func waitForVideo(ctx context.Context, c *config) error {
 			// before the loop runs once. The old wording blamed the baseline, which
 			// was never attempted.
 			if polls == 0 {
-				return fmt.Errorf("no playback after %ds -- the whole budget went to connecting to %s, so the box was never polled (raise TUNE_TIMEOUT, or check it is reachable)",
-					int(elapsed.Seconds()), c.tunerIP)
+				return fmt.Errorf("no playback after %v -- the whole budget went to connecting to %s, so the box was never polled (raise TUNE_TIMEOUT, or check it is reachable)",
+					elapsed.Round(time.Millisecond), c.tunerIP)
 			}
 			if illegible > 0 && illegible+adbFailures == polls {
-				return fmt.Errorf("no playback after %ds -- %s answered %d of %d polls but never returned a readable dump (does `adb -s %s shell dumpsys media.resource_manager` work?)",
-					int(elapsed.Seconds()), c.tunerIP, illegible, polls, c.tunerIP)
+				return fmt.Errorf("no playback after %v -- %s answered %d of %d polls but never returned a dump this could read (%d polls got no answer at all); try `adb -s %s shell dumpsys media.resource_manager`",
+					elapsed.Round(time.Millisecond), c.tunerIP, illegible, polls, adbFailures, c.tunerIP)
 			}
 			if adbFailures == polls {
-				return fmt.Errorf("no playback after %ds -- every adb call to %s failed or returned nothing (is adb reachable? does TUNER%s_IP include :5555?)",
-					int(elapsed.Seconds()), c.tunerIP, c.tuner)
+				return fmt.Errorf("no playback after %v -- every adb call to %s failed or returned nothing (is adb reachable? does TUNER%s_IP include :5555?)",
+					elapsed.Round(time.Millisecond), c.tunerIP, c.tuner)
 			}
 			// Past those two, at least one poll returned output, and the first one
 			// that did took the baseline -- so haveBase is necessarily true here.
@@ -545,29 +548,47 @@ func waitForVideo(ctx context.Context, c *config) error {
 		// a dumpsys timeout, the service restarting -- yields an EMPTY baseline,
 		// and then the outgoing channel's decoder reads as new on the next poll.
 		// Accept a baseline only from a half we could actually read.
-		legible := strings.Contains(rm, "Processes:") || strings.Contains(rm, "Events logs") ||
-			strings.Contains(ms, "PlaybackState")
+		// Legibility of each half, judged separately. Letting the session half
+		// vouch for the resource half made a binder blip install an empty codec
+		// baseline; requiring the resource half outright made every tune fail on a
+		// box that simply has no resource manager. They are different questions.
+		rmLegible := strings.Contains(rm, "Processes:") || strings.Contains(rm, "Events logs")
 		// A truncated transport is a fault the reconnect exists for, so it has to
 		// keep counting toward consecFailures rather than resetting it.
-		if legible && complete {
+		if complete {
 			consecFailures = 0
 		}
+		// Completeness alone gates the timing/session baseline. Legibility of the
+		// resource half gates only the CODEC baseline, below -- a box that has no
+		// resource manager must still be able to tune on the session fallback,
+		// and requiring a legible dump here failed every tune on one.
 		if !haveBase {
-			if !legible || !complete {
+			if !complete {
 				// Waiting costs a poll; accepting opens the gate on the old channel.
 				// NOT counted as an adb failure when adb actually answered -- counting
 				// it made the timeout blame the network for a box that replied to
 				// every poll.
-				if legible || complete {
-					illegible++
-				} else {
-					adbFailures++
+				illegible++
+				// A transport that truncates is the fault the reconnect exists for,
+				// so it has to count like one -- incrementing only on empty output
+				// meant pure truncation never reached it.
+				consecFailures++
+				if consecFailures >= 3 && time.Since(lastConnect) > 5*time.Second {
+					lastConnect = time.Now()
+					connect(time.Until(deadline))
 				}
 				time.Sleep(c.poll)
 				continue
 			}
 			haveBase = true
-			baseIDs, baseSet = ids, setOf(ids)
+			// The codec baseline is only taken from a legible resource dump, and
+			// separately from this one, so a transient failure cannot make the
+			// outgoing channel's decoder look new -- and a permanent one cannot stop
+			// the session fallback from working.
+			if rmLegible {
+				haveCodecBase = true
+				baseIDs, baseSet = ids, setOf(ids)
+			}
 			// The session has no identity, so it only counts once it has dropped at
 			// least once since we started -- otherwise a session left parked at
 			// state=3 by the previous channel reads as instant success.
@@ -585,13 +606,23 @@ func waitForVideo(ctx context.Context, c *config) error {
 			continue
 		}
 
+		if !haveCodecBase && rmLegible {
+			haveCodecBase = true
+			baseIDs, baseSet = ids, setOf(ids)
+			if c.debug {
+				logf(c, "codec baseline deferred to poll %d: %s", polls, orNone(strings.Join(baseIDs, ",")))
+			}
+			time.Sleep(c.poll)
+			continue
+		}
+
 		// A decoder we did not start with is proof of new playback and needs no
 		// arming, because it carries its own identity. The session does not, so it
 		// only counts once armed.
 		via := ""
 		playing := false
 		switch {
-		case newCodec(ids, baseSet) != "":
+		case haveCodecBase && newCodec(ids, baseSet) != "":
 			playing, via = true, "codec "+newCodec(ids, baseSet)
 		case session == "playing" && armed:
 			playing, via = true, "session playing"
@@ -905,6 +936,7 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 	winBytes := 0
 	winStart := time.Now()
 	floorRate := -1.0
+	floor1, floor2 := math.MaxFloat64, math.MaxFloat64
 	motionSeen := false
 	motionStreak := 0
 	var motionAt time.Time
@@ -1121,8 +1153,22 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 					// `floorRate > 0` test below then disables detection for the whole
 					// tune. Neither ever recovers, because the floor only decreases.
 					// An HDMI resync at the channel change produces exactly this.
-					if winBytes >= minWindowPackets*tsPacketSize && (floorRate < 0 || rate < floorRate) {
-						floorRate = rate
+					if winBytes >= minWindowPackets*tsPacketSize {
+						// The two lowest rates seen, using the SECOND lowest as the
+						// floor. A packet-count threshold alone cannot close this: a
+						// gap window only has to squeak past the count to sit
+						// RISE_FACTOR below the card, and the card then reads as
+						// motion. One artifact can be the lowest; it takes two to be
+						// the second lowest, and two independent gaps in one tune is
+						// a different order of unlikely.
+						if rate < floor1 {
+							floor2, floor1 = floor1, rate
+						} else if rate < floor2 {
+							floor2 = rate
+						}
+						if floor2 < math.MaxFloat64 {
+							floorRate = floor2
+						}
 					}
 					if floorRate > 0 && rate > floorRate*c.riseFactor {
 						motionStreak++
