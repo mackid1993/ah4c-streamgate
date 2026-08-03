@@ -215,6 +215,8 @@ streamgate[1]: no playback after 40s (adb ok on 158/160 polls, base=none) -- dev
 
 ## Troubleshooting
 
+**Which build am I running?** `streamgate --version`. Release binaries are stamped with their tag; a build from source reports `dev`.
+
 **Every tune times out.** Check that adb works from inside the container — `docker exec <container> adb devices` should list your tuner as `device`, not `offline` or `unauthorized`. Then check the box exposes at least one signal:
 
 ```sh

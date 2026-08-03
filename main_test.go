@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
 	"time"
 )
@@ -242,9 +243,15 @@ const (
 	vidHi, vidLo = byte(testVideoPid >> 8), byte(testVideoPid & 0xff)
 )
 
-func fill(pkt []byte, from int, seq byte) {
+// fill writes a unique body. The first two bytes are a 16-bit counter: a single
+// byte repeated every 256 packets, which silently broke the uniqueness that
+// locating a run of output in the input depends on.
+func fill(pkt []byte, from int, seq int) {
 	for i := from; i < tsPacketSize; i++ {
-		pkt[i] = seq
+		pkt[i] = byte(seq*7 + i*13)
+	}
+	if from+1 < tsPacketSize {
+		pkt[from], pkt[from+1] = byte(seq>>8), byte(seq)
 	}
 }
 
@@ -287,7 +294,7 @@ func pmtPacket(cc byte) []byte {
 	return p
 }
 
-func videoPacket(cc byte, key bool, seq byte) []byte {
+func videoPacket(cc byte, key bool, seq int) []byte {
 	p := make([]byte, tsPacketSize)
 	p[0] = 0x47
 	p[1] = 0x40 | vidHi
@@ -312,7 +319,7 @@ func buildStream(nVideo, keyEvery int) []byte {
 	b = append(b, patPacket(0)...)
 	b = append(b, pmtPacket(0)...)
 	for i := 0; i < nVideo; i++ {
-		b = append(b, videoPacket(byte(i&0x0f), i > 0 && i%keyEvery == 0, byte(i+1))...)
+		b = append(b, videoPacket(byte(i&0x0f), i > 0 && i%keyEvery == 0, i+1)...)
 	}
 	return b
 }
@@ -321,11 +328,26 @@ func buildStream(nVideo, keyEvery int) []byte {
 // reads come off the network rather than out of a buffer.
 func serveTS(t *testing.T, data []byte, gap time.Duration) *httptest.Server {
 	t.Helper()
+	return serveTSGate(t, data, gap, -1, nil)
+}
+
+// serveTSGate is serveTS, but it closes `gate` just before writing packet
+// gateAt and pauses so the reader is certain to observe it first. That makes the
+// gate position KNOWN, which is what lets a test assert the exact packet the
+// output started on -- without it, the only start-side assertion possible is
+// "not packet zero", which a build that ignores the gate entirely still passes.
+func serveTSGate(t *testing.T, data []byte, gap time.Duration, gateAt int, gate chan struct{}) *httptest.Server {
+	t.Helper()
+	var once sync.Once
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "video/mp2t")
 		w.WriteHeader(http.StatusOK)
 		fl, _ := w.(http.Flusher)
-		for i := 0; i+tsPacketSize <= len(data); i += tsPacketSize {
+		for i, n := 0, 0; i+tsPacketSize <= len(data); i, n = i+tsPacketSize, n+1 {
+			if gate != nil && n == gateAt {
+				once.Do(func() { close(gate) })
+				time.Sleep(4 * gap)
+			}
 			if _, err := w.Write(data[i : i+tsPacketSize]); err != nil {
 				return
 			}
@@ -335,6 +357,18 @@ func serveTS(t *testing.T, data []byte, gap time.Duration) *httptest.Server {
 			time.Sleep(gap)
 		}
 	}))
+}
+
+// firstKeyframeAt returns the index of the first video random-access packet at or
+// after `from`, which is exactly where an aligned stream must start.
+func firstKeyframeAt(input []byte, from int) int {
+	for i := from; (i+1)*tsPacketSize <= len(input); i++ {
+		p := input[i*tsPacketSize : (i+1)*tsPacketSize]
+		if randomAccess(p) && pid(p) == testVideoPid {
+			return i
+		}
+	}
+	return -1
 }
 
 func testConfig(url string) *config {
@@ -375,7 +409,7 @@ func runStream(t *testing.T, c *config, gate <-chan struct{}) []byte {
 // checkContiguous asserts the README's actual promise: after the injected
 // tables, the output is an unbroken run of the input that starts on a keyframe
 // and continues to the end. A single dropped packet fails this.
-func checkContiguous(t *testing.T, input, out []byte, wantSkipped bool) {
+func checkContiguous(t *testing.T, input, out []byte, wantStart int) {
 	t.Helper()
 	if len(out) < 3*tsPacketSize {
 		t.Fatalf("output is %d bytes, want tables plus video", len(out))
@@ -401,8 +435,13 @@ func checkContiguous(t *testing.T, input, out []byte, wantSkipped bool) {
 		t.Fatalf("output ends %d bytes early -- packets were dropped near the end",
 			len(input)-(idx+len(rest)))
 	}
-	if wantSkipped && idx == 0 {
-		t.Error("expected the pre-gate packets to be skipped, but the output starts at packet 0")
+	// The exact packet, not "somewhere after zero". buildStream never makes
+	// packet 0 a keyframe, so idx != 0 held even for a build that ignored the
+	// gate completely and emitted 30 packets of pre-gate video -- and equally for
+	// one that aligned two keyframes late and threw away good video.
+	if wantStart >= 0 && idx/tsPacketSize != wantStart {
+		t.Errorf("output starts at packet %d, want %d (the first keyframe at or after the gate)",
+			idx/tsPacketSize, wantStart)
 	}
 }
 
@@ -415,22 +454,23 @@ func TestStreamOutputIsContiguous(t *testing.T) {
 
 	gate := make(chan struct{})
 	close(gate)
-	checkContiguous(t, input, runStream(t, testConfig(srv.URL), gate), false)
+	checkContiguous(t, input, runStream(t, testConfig(srv.URL), gate), firstKeyframeAt(input, 0))
 }
 
 // Nothing received before the gate opens may ever be emitted, and what is
 // emitted still has to be unbroken.
 func TestStreamEmitsNothingBeforeTheGate(t *testing.T) {
+	const gateAt = 40
 	input := buildStream(120, 10)
-	srv := serveTS(t, input, 3*time.Millisecond)
+	gate := make(chan struct{})
+	srv := serveTSGate(t, input, 3*time.Millisecond, gateAt, gate)
 	defer srv.Close()
 
-	gate := make(chan struct{})
-	go func() {
-		time.Sleep(120 * time.Millisecond)
-		close(gate)
-	}()
-	checkContiguous(t, input, runStream(t, testConfig(srv.URL), gate), true)
+	want := firstKeyframeAt(input, gateAt)
+	if want <= gateAt {
+		t.Fatalf("fixture is wrong: no keyframe after the gate at packet %d", gateAt)
+	}
+	checkContiguous(t, input, runStream(t, testConfig(srv.URL), gate), want)
 }
 
 // With ALIGN_KEYFRAME off there is no alignment and no injected tables, but the
@@ -496,7 +536,7 @@ func TestStreamSurvivesADVRStall(t *testing.T) {
 	cancel()
 	stdoutW = saved
 
-	checkContiguous(t, input, w.buf.Bytes(), false)
+	checkContiguous(t, input, w.buf.Bytes(), firstKeyframeAt(input, 0))
 }
 
 // A PSI continuation packet carries no table header. Parsing one yields garbage
@@ -507,7 +547,7 @@ func TestStreamIgnoresPSIContinuation(t *testing.T) {
 	input = append(input, patPacket(0)...)
 	input = append(input, pmtPacket(0)...)
 	for i := 0; i < 5; i++ {
-		input = append(input, videoPacket(byte(i), false, byte(i+1))...)
+		input = append(input, videoPacket(byte(i), false, i+1)...)
 	}
 	// PID 0 with payload_unit_start CLEAR and a body that parses to nonsense.
 	cont := make([]byte, tsPacketSize)
@@ -515,7 +555,7 @@ func TestStreamIgnoresPSIContinuation(t *testing.T) {
 	fill(cont, 4, 0x55)
 	input = append(input, cont...)
 	for i := 5; i < 40; i++ {
-		input = append(input, videoPacket(byte(i&0x0f), i%10 == 0, byte(i+1))...)
+		input = append(input, videoPacket(byte(i&0x0f), i%10 == 0, i+1)...)
 	}
 
 	srv := serveTS(t, input, 3*time.Millisecond)
@@ -533,7 +573,7 @@ func TestStreamIgnoresPSIContinuation(t *testing.T) {
 	if !bytes.Equal(out[tsPacketSize:2*tsPacketSize], input[tsPacketSize:2*tsPacketSize]) {
 		t.Error("injected PMT is not the real PMT")
 	}
-	checkContiguous(t, input, out, false)
+	checkContiguous(t, input, out, firstKeyframeAt(input, 0))
 }
 
 // The fail-safe that matters most: a tune that carried no picture must put zero
@@ -545,7 +585,7 @@ func TestNoVideoMeansNoBytes(t *testing.T) {
 	input = append(input, patPacket(0)...)
 	input = append(input, pmtPacket(0)...)
 	for i := 0; i < 20; i++ { // video, but never a keyframe
-		input = append(input, videoPacket(byte(i&0x0f), false, byte(i+1))...)
+		input = append(input, videoPacket(byte(i&0x0f), false, i+1)...)
 	}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

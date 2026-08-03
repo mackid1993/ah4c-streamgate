@@ -84,6 +84,12 @@ type config struct {
 // nothing but stream bytes may ever be written here.
 var stdoutW io.Writer = os.Stdout
 
+// version is stamped at build time with -ldflags "-X main.version=...". Reported
+// by `streamgate --version` rather than logged, so it costs no noise per tune but
+// still answers "which build is this?" -- the first question of every support
+// thread about a prebuilt binary.
+var version = "dev"
+
 func logf(c *config, format string, a ...interface{}) {
 	fmt.Fprintf(os.Stderr, "streamgate[%s]: %s\n", c.tuner, fmt.Sprintf(format, a...))
 }
@@ -427,14 +433,21 @@ func waitForVideo(ctx context.Context, c *config) error {
 		if elapsed >= c.tuneTimeout {
 			// Say WHICH failure this was. adb being unreachable and the box simply
 			// not playing produced the same message, which is undiagnosable.
-			if polls > 0 && adbFailures == polls {
+			//
+			// polls == 0 is its own case: `adb connect` is bounded by the same
+			// deadline, so a box that is slow to answer can eat the entire budget
+			// before the loop runs once. The old wording blamed the baseline, which
+			// was never attempted.
+			if polls == 0 {
+				return fmt.Errorf("no playback after %ds -- the whole budget went to connecting to %s, so the box was never polled (raise TUNE_TIMEOUT, or check it is reachable)",
+					int(elapsed.Seconds()), c.tunerIP)
+			}
+			if adbFailures == polls {
 				return fmt.Errorf("no playback after %ds -- every adb call to %s failed or returned nothing (is adb reachable? does TUNER%s_IP include :5555?)",
 					int(elapsed.Seconds()), c.tunerIP, c.tuner)
 			}
-			if !haveBase {
-				return fmt.Errorf("no playback after %ds (adb ok on %d/%d polls) -- never got a usable baseline from %s",
-					int(elapsed.Seconds()), polls-adbFailures, polls, c.tunerIP)
-			}
+			// Past those two, at least one poll returned output, and the first one
+			// that did took the baseline -- so haveBase is necessarily true here.
 			return fmt.Errorf("no playback after %ds (adb ok on %d/%d polls, base=%s) -- device reported no secure decoder and no playing media session",
 				int(elapsed.Seconds()), polls-adbFailures, polls, orNone(strings.Join(baseIDs, ",")))
 		}
@@ -614,7 +627,11 @@ func videoPIDs(payload []byte) map[uint16]bool {
 	progInfoLen := int(uint16(payload[10]&0x0f)<<8 | uint16(payload[11]))
 	i := 12 + progInfoLen
 	end := 3 + sectionLen - 4 // minus CRC
-	for i+4 <= end && i+5 <= len(payload) {
+	// i+5, not i+4: an ES entry is FIVE bytes (i..i+4), so the last byte must
+	// still be below `end`. At i+4 == end the length field is read out of the
+	// CRC, which on a truncated section invents an elementary stream. pmtPIDs
+	// below uses i+4 for its four-byte entries, which is the same rule.
+	for i+5 <= end && i+5 <= len(payload) {
 		st := payload[i]
 		epid := uint16(payload[i+1]&0x1f)<<8 | uint16(payload[i+2])
 		esLen := int(uint16(payload[i+3]&0x0f)<<8 | uint16(payload[i+4]))
@@ -649,7 +666,10 @@ func pmtPIDs(payload []byte) map[uint16]bool {
 func payload(p []byte, psi bool) []byte {
 	afc := (p[3] >> 4) & 0x03
 	off := 4
-	if afc == 2 {
+	// afc 0 is reserved and afc 2 is adaptation-field-only; neither carries a
+	// payload. Falling through on 0 handed back 184 bytes of whatever followed
+	// the header as though it were one.
+	if afc == 0 || afc == 2 {
 		return nil
 	}
 	if afc == 3 {
@@ -1071,6 +1091,11 @@ func main() {
 	// NORMAL end of every recording -- the DVR disconnecting -- look like a crash
 	// (exit 141), skip the write-error path entirely, and log nothing.
 	signal.Ignore(syscall.SIGPIPE)
+
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
+		fmt.Fprintln(os.Stderr, "streamgate", version)
+		os.Exit(0)
+	}
 
 	c, err := loadConfig()
 	if err != nil {
