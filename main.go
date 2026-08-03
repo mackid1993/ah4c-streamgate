@@ -234,6 +234,24 @@ func warnEnv(k, v, why string) {
 	fmt.Fprintf(os.Stderr, "streamgate: ignoring %s=%q -- %s; using the default\n", k, v, why)
 }
 
+// onTimeoutMode validates the fail-safe rather than accepting anything. It was
+// the only setting read without a warn path, so a typo -- ON_TIMEOUT=fial --
+// silently turned the fail-safe OFF and streamed a loading screen for the length
+// of a programme, with no warning line anywhere. An unrecognised value now warns
+// and keeps the safe default.
+func onTimeoutMode() string {
+	v := strings.ToLower(envRaw("ON_TIMEOUT"))
+	switch v {
+	case "":
+		return "fail"
+	case "fail", "stream", "continue":
+		return v
+	default:
+		warnEnv("ON_TIMEOUT", v, "want fail or stream")
+		return "fail"
+	}
+}
+
 func loadConfig() (*config, error) {
 	if len(os.Args) < 2 {
 		return nil, errors.New("usage: streamgate <tuner-number>")
@@ -257,7 +275,7 @@ func loadConfig() (*config, error) {
 		// frames and showing a brief blue/black flash at the head of a recording.
 		// Far cheaper than waiting for the render signal proper (~0.7s).
 		settle:        envDurOff("SETTLE", 250*time.Millisecond),
-		onTimeout:     strings.ToLower(env("ON_TIMEOUT", "fail")),
+		onTimeout:     onTimeoutMode(),
 		alignKey:      envBool("ALIGN_KEYFRAME", true),
 		alignTimeout:  envDur("ALIGN_TIMEOUT", 8*time.Second),
 		waitMotion:    envBool("WAIT_MOTION", true),
@@ -1021,6 +1039,7 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) (wrote boo
 
 	open := false
 	aligned := false
+	alignGaveUp := false
 	pkt := make([]byte, tsPacketSize)
 	discarded := 0
 	skippedKeys := 0
@@ -1087,7 +1106,7 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) (wrote boo
 		// the mid-GOP start we were trying to improve on. Give up and pass the
 		// bytes through instead.
 		if open && !aligned && time.Since(gateAt) > c.alignTimeout+relaxWindow {
-			aligned = true
+			aligned, alignGaveUp = true, true
 			logf(c, "no keyframe recognised within %s; streaming unaligned (encoder may not signal random access -- try ALIGN_KEYFRAME=0)", c.alignTimeout+relaxWindow)
 			// Still send the tables, otherwise the DVR has to wait for the
 			// encoder's next PSI cycle on top of everything else.
@@ -1343,10 +1362,15 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) (wrote boo
 		// EOF, long after the bytes had gone.
 		// Only evaluated until the first real packet: after that `wrote` is true
 		// and the map lookup would run on every packet for the whole recording.
-		// When the PMT named the video pids, require one of them; otherwise fall
-		// back to excluding what is definitely not picture.
+		// When the PMT named the video pids, require one of them -- but only while
+		// we still believe them. alignCandidate has an escape hatch for a PMT that
+		// names a video pid the mux never carries; this filter was written from it
+		// and the escape was left out, so on such a stream ALIGN_TIMEOUT released
+		// alignment and then every single packet was suppressed: zero bytes out of
+		// an encoder streaming video continuously, and a log blaming the HDMI
+		// input. Once alignment has given up on recognising video, so does this.
 		notPicture := p == 0x1fff || p == 0 || pmtPids[p]
-		if len(vidPids) > 0 {
+		if len(vidPids) > 0 && !alignGaveUp {
 			notPicture = !vidPids[p]
 		}
 		if !wrote && notPicture {

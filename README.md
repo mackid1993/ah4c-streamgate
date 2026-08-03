@@ -151,7 +151,7 @@ The defaults are tuned; most people should never touch these.
 | `SETTLE` | `0.25` | Pause after detecting, before opening the gate. `0` skips it. See "if a recording starts on the app's tuning screen" below. |
 | `MIN_WAIT` | `1` | Ignore "playing" for this many seconds after start. `0` accepts a sighting on the first poll. |
 | `TUNE_TIMEOUT` | `40` | Give up after this long. Costs nothing on a tune that works — the wait ends the moment playback is detected. |
-| `ON_TIMEOUT` | `fail` | `fail` exits without streaming, so your DVR sees a dead tune and can retry or pick another tuner. Anything else streams whatever is on screen. |
+| `ON_TIMEOUT` | `fail` | `fail` exits without streaming, so your DVR sees a dead tune and can retry or pick another tuner. `stream` sends whatever is on screen instead. An unrecognised value warns and keeps `fail` — a typo here used to disable the fail-safe silently. |
 | `ALIGN_KEYFRAME` | `1` | Start output on a keyframe. `0` streams from wherever the encoder happens to be — and because the motion gate runs while waiting to align, `0` turns `WAIT_MOTION` off too. |
 | `ALIGN_TIMEOUT` | `8` | If no keyframe is recognised within this long, stream unaligned rather than stall. Automatically raised above `MOTION_TIMEOUT` if you set them so they'd conflict. |
 | `WAIT_AUDIO` | `0` | After the decoder appears, also wait for audio playback to start. Costs ~0.7s. Only needed if a flash survives `SETTLE`. |

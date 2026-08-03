@@ -758,3 +758,33 @@ func TestReadPacketRejectsAFalseSyncLock(t *testing.T) {
 		t.Errorf("relaxed=%v warned=%v; want the scan limit to relax and warn rather than stall", relaxed, warned)
 	}
 }
+
+// Every existing fixture puts all PSI and all null padding BEFORE the alignment
+// point, so byte-exactness was only ever asserted over a run of pure video.
+// Dropping the `!wrote &&` guard strips every PAT, PMT and null packet from a
+// live recording for its whole duration -- and the suite stayed green.
+func TestStreamKeepsInterleavedTablesAndPadding(t *testing.T) {
+	var input []byte
+	input = append(input, patPacket(0)...)
+	input = append(input, pmtPacket(0)...)
+	for i := 0; i < 120; i++ {
+		input = append(input, videoPacket(byte(i&0x0f), i > 0 && i%20 == 0, i+1)...)
+		switch i % 7 {
+		case 3: // null padding, mid-recording
+			null := make([]byte, tsPacketSize)
+			null[0], null[1], null[2], null[3] = 0x47, 0x1f, 0xff, 0x10
+			fill(null, 4, 900+i)
+			input = append(input, null...)
+		case 5: // the encoder's own PSI cycle, mid-recording
+			input = append(input, patPacket(byte(i&0x0f))...)
+			input = append(input, pmtPacket(byte(i&0x0f))...)
+		}
+	}
+	srv := serveTS(t, input, time.Millisecond)
+	defer srv.Close()
+	gate := make(chan struct{})
+	close(gate)
+
+	out := runStream(t, testConfig(srv.URL), gate)
+	checkContiguous(t, input, out, firstKeyframeAt(input, 0))
+}
