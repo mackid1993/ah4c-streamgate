@@ -50,9 +50,12 @@ type config struct {
 	poll        time.Duration
 	confirmPoll time.Duration
 	settle      time.Duration
-	onTimeout   string
-	alignKey    bool
-	debug       bool
+	onTimeout     string
+	alignKey      bool
+	alignTimeout  time.Duration
+	waitAudio     bool
+	renderTimeout time.Duration
+	debug         bool
 }
 
 func logf(c *config, format string, a ...interface{}) {
@@ -101,10 +104,17 @@ func loadConfig() (*config, error) {
 		confirm:     envInt("CONFIRM", 1),
 		poll:        envDur("POLL", 250*time.Millisecond),
 		confirmPoll: envDur("CONFIRM_POLL", 50*time.Millisecond),
-		settle:      envDur("SETTLE", 0),
-		onTimeout:   env("ON_TIMEOUT", "fail"),
-		alignKey:    env("ALIGN_KEYFRAME", "1") != "0",
-		debug:       os.Getenv("DEBUG") != "",
+		// The decoder is allocated a beat before the display catches up, so a
+		// short settle here keeps keyframe alignment from landing on pre-render
+		// frames and showing a brief blue/black flash at the head of a recording.
+		// Far cheaper than waiting for the render signal proper (~0.7s).
+		settle:      envDur("SETTLE", 250*time.Millisecond),
+		onTimeout:     env("ON_TIMEOUT", "fail"),
+		alignKey:      env("ALIGN_KEYFRAME", "1") != "0",
+		alignTimeout:  envDur("ALIGN_TIMEOUT", 5*time.Second),
+		waitAudio:     env("WAIT_AUDIO", "0") != "0",
+		renderTimeout: envDur("RENDER_TIMEOUT", 3*time.Second),
+		debug:         os.Getenv("DEBUG") != "",
 	}
 	if c.encoderURL == "" {
 		return nil, fmt.Errorf("ENCODER%s_URL not set", n)
@@ -149,6 +159,30 @@ func secureCodecID(dump string) string {
 	return ""
 }
 
+// mediaSessionState reads the top media session. Fallback for devices where the
+// resource-manager format above is absent or unfamiliar -- notably anything
+// older than Android 11, and vendor builds that report codecs differently.
+// Without a fallback such a device never detects anything and every tune fails.
+//
+// state=3 with speed=1 is playing; state=2 is stopped. Checked in that order
+// because a line can carry both and playing is the stronger claim.
+func mediaSessionState(dump string) string {
+	for _, line := range strings.Split(dump, "\n") {
+		if !strings.Contains(line, "PlaybackState") {
+			continue
+		}
+		if (strings.Contains(line, "state=3") || strings.Contains(line, "PLAYING(3)")) &&
+			strings.Contains(line, "speed=1") {
+			return "playing"
+		}
+		if strings.Contains(line, "state=2") {
+			return "stopped"
+		}
+		return "unknown"
+	}
+	return "unknown"
+}
+
 func adbShell(ctx context.Context, ip, cmd string) string {
 	c, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -163,9 +197,25 @@ func adbShell(ctx context.Context, ip, cmd string) string {
 func waitForVideo(ctx context.Context, c *config) error {
 	exec.Command("adb", "connect", c.tunerIP).Run()
 
-	base := secureCodecID(adbShell(ctx, c.tunerIP, "dumpsys media.resource_manager"))
+	// One round trip per poll: the resource dump, a marker, then the top
+	// PlaybackState line.
+	const probe = "dumpsys media.resource_manager; echo __MS__; dumpsys media_session | grep -m1 PlaybackState"
+	split := func(out string) (string, string) {
+		if i := strings.Index(out, "__MS__"); i >= 0 {
+			return out[:i], out[i+len("__MS__"):]
+		}
+		return out, ""
+	}
+
+	rm, ms := split(adbShell(ctx, c.tunerIP, probe))
+	base := secureCodecID(rm)
+	baseSession := mediaSessionState(ms)
+	// The session has no identity, so it only counts once it has dropped at
+	// least once since we started -- otherwise a session left parked at
+	// state=3 by the previous channel reads as instant success.
+	armed := baseSession != "playing"
 	if c.debug {
-		logf(c, "baseline codec=%s", orNone(base))
+		logf(c, "baseline codec=%s session=%s armed=%v", orNone(base), baseSession, armed)
 	}
 
 	start := time.Now()
@@ -176,12 +226,28 @@ func waitForVideo(ctx context.Context, c *config) error {
 			return fmt.Errorf("no playback after %ds (base=%s)", int(elapsed.Seconds()), orNone(base))
 		}
 
-		id := secureCodecID(adbShell(ctx, c.tunerIP, "dumpsys media.resource_manager"))
-		playing := id != "" && id != base
+		rm, ms := split(adbShell(ctx, c.tunerIP, probe))
+		id := secureCodecID(rm)
+		session := mediaSessionState(ms)
+
+		// A decoder that is not the one we started with is proof of new playback
+		// and needs no arming, because it carries its own identity. The session
+		// does not, so it only counts once armed.
+		via := ""
+		playing := false
+		switch {
+		case id != "" && id != base:
+			playing, via = true, "codec "+id
+		case session == "playing" && armed:
+			playing, via = true, "session playing"
+		}
+		if session != "playing" {
+			armed = true
+		}
 
 		if c.debug {
-			logf(c, "t=%.1fs codec=%s base=%s hits=%d playing=%v",
-				elapsed.Seconds(), orNone(id), orNone(base), hits, playing)
+			logf(c, "t=%.1fs codec=%s base=%s session=%s armed=%v hits=%d playing=%v",
+				elapsed.Seconds(), orNone(id), orNone(base), session, armed, hits, playing)
 		}
 
 		if playing && elapsed >= c.minWait {
@@ -190,8 +256,8 @@ func waitForVideo(ctx context.Context, c *config) error {
 				if c.settle > 0 {
 					time.Sleep(c.settle)
 				}
-				logf(c, "playback detected after %ds via codec %s (was %s), %d confirmation(s)",
-					int(time.Since(start).Seconds()), id, orNone(base), hits)
+				logf(c, "playback detected after %ds via %s (base %s), %d confirmation(s)",
+					int(time.Since(start).Seconds()), via, orNone(base), hits)
 				return nil
 			}
 			time.Sleep(c.confirmPoll)
@@ -207,6 +273,61 @@ func orNone(s string) string {
 		return "none"
 	}
 	return s
+}
+
+// audioStarted reports whether the app has an AudioTrack in the started state
+// carrying media content.
+//
+// This is the render signal, and it is why it matters: on a tunneled+secure
+// pipeline the video decoder is slaved to the audio hardware sync clock
+// (ACodec configures tunneled playback with an audio-hw-sync id), so the first
+// pixel cannot be presented before the tunneled audio output is running.
+// Decoder ALLOCATION -- which is what media.resource_manager reports -- happens
+// measurably earlier, ~0.6-0.8s on the hardware this was written against.
+//
+// Handing off at allocation used to be harmless because the DVR then discarded
+// everything up to the next keyframe, which usually landed after the transition
+// had finished. Once the output is keyframe-aligned that slack disappears and
+// the pre-render frames become visible, which shows up as a blue/black flash at
+// the head of the recording.
+func audioStarted(ctx context.Context, c *config) bool {
+	dump := adbShell(ctx, c.tunerIP, "dumpsys audio")
+	if dump == "" {
+		return false
+	}
+	for _, line := range strings.Split(dump, "\n") {
+		if !strings.Contains(line, "AudioPlaybackConfiguration") {
+			continue
+		}
+		if !strings.Contains(line, "state:started") {
+			continue
+		}
+		// Ignore UI sounds; only real media counts.
+		if strings.Contains(line, "CONTENT_TYPE_MOVIE") ||
+			strings.Contains(line, "CONTENT_TYPE_MUSIC") ||
+			strings.Contains(line, "usage=USAGE_MEDIA") {
+			return true
+		}
+	}
+	return false
+}
+
+// waitForRender blocks until audio playback has actually started, bounding the
+// wait so a device that never reports it still tunes.
+func waitForRender(ctx context.Context, c *config) {
+	if !c.waitAudio {
+		return
+	}
+	start := time.Now()
+	for time.Since(start) < c.renderTimeout {
+		if audioStarted(ctx, c) {
+			logf(c, "render confirmed after a further %dms (audio playback started)",
+				time.Since(start).Milliseconds())
+			return
+		}
+		time.Sleep(c.confirmPoll)
+	}
+	logf(c, "render not confirmed within %s, handing off anyway", c.renderTimeout)
 }
 
 // ------------------------------------------------------------ TS inspection
@@ -339,17 +460,30 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 	aligned := false
 	pkt := make([]byte, tsPacketSize)
 	discarded := 0
+	var gateAt time.Time
 
 	for {
 		if !open {
 			select {
 			case <-gate:
 				open = true
+				gateAt = time.Now()
 				if !c.alignKey {
 					aligned = true
 				}
 			default:
 			}
+		}
+
+		// Not every encoder signals random access in the adaptation field, and
+		// not every stream is one this parser understands. Without this bound a
+		// stream that never presents a recognisable keyframe would be discarded
+		// forever and the tune would produce no output at all -- far worse than
+		// the mid-GOP start we were trying to improve on. Give up and pass the
+		// bytes through instead.
+		if open && !aligned && time.Since(gateAt) > c.alignTimeout {
+			aligned = true
+			logf(c, "no keyframe found within %s (encoder may not signal random access); streaming unaligned", c.alignTimeout)
 		}
 
 		if err := readPacket(br, pkt); err != nil {
@@ -382,8 +516,11 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 		}
 
 		if !aligned {
-			// Only a video-PID random access point starts a decodable picture.
-			if !(vidPids[p] && randomAccess(pkt)) {
+			// Prefer a random access point on a PID the PMT identified as video.
+			// If no PMT was seen, or it lists stream types this does not know,
+			// take any random access point rather than discarding indefinitely --
+			// a slightly worse start beats no picture on unfamiliar hardware.
+			if !(randomAccess(pkt) && (vidPids[p] || len(vidPids) == 0)) {
 				discarded++
 				continue
 			}
@@ -449,6 +586,10 @@ func main() {
 		}
 		close(gate)
 	} else {
+		// The decoder exists, but on a tunneled pipeline nothing is on screen
+		// until audio starts. Keyframe alignment removed the slack that used to
+		// hide that gap, so confirm render before opening the gate.
+		waitForRender(ctx, c)
 		close(gate)
 	}
 
