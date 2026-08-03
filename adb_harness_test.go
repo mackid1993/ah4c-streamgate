@@ -929,7 +929,7 @@ func TestAudioStarted(t *testing.T) {
 			a := hNewADB(t, hStep{ids: []string{"A"}})
 			a.setAudio(tc.dump)
 			c := hConfig()
-			if got := audioStarted(context.Background(), c, time.Second); got != tc.want {
+			if got := audioStarted(context.Background(), c, nil, time.Second); got != tc.want {
 				t.Errorf("audioStarted = %v, want %v", got, tc.want)
 			}
 		})
@@ -939,7 +939,7 @@ func TestAudioStarted(t *testing.T) {
 func TestAudioStartedOnAFailedProbe(t *testing.T) {
 	a := hNewADB(t, hStep{ids: []string{"A"}})
 	a.setAudio("@FAIL\n")
-	if audioStarted(context.Background(), hConfig(), time.Second) {
+	if audioStarted(context.Background(), hConfig(), nil, time.Second) {
 		t.Error("audioStarted = true for a failed dumpsys")
 	}
 }
@@ -959,10 +959,16 @@ func TestWaitForRender(t *testing.T) {
 	})
 
 	t.Run("confirmed", func(t *testing.T) {
+		// The track must start AFTER the detection-time baseline -- a track
+		// already running at detection is, correctly, not render evidence.
 		a := hNewADB(t, hStep{ids: []string{"A"}})
-		a.setAudio("AudioPlaybackConfiguration: state:started usage=USAGE_MEDIA\n")
+		a.setAudio("AudioPlaybackConfiguration piid:9 state:idle usage=USAGE_MEDIA\n")
 		c := hConfig()
 		c.waitAudio = true
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			a.setAudio("AudioPlaybackConfiguration piid:9 state:started usage=USAGE_MEDIA\n")
+		}()
 		var log string
 		start := time.Now()
 		log = hCaptureStderr(t, func() { waitForRender(context.Background(), c) })
@@ -1594,22 +1600,44 @@ func TestAudioRenderGateRequiresANewPiid(t *testing.T) {
 
 	a := hNewADB(t, hStep{ids: []string{"A"}})
 	c := hConfig()
-	c.baseAudioPiids = base
 
 	// The old channel's track alone must NOT confirm render.
 	a.setAudio(oldOnly)
-	if audioStarted(context.Background(), c, time.Second) {
+	if audioStarted(context.Background(), c, base, time.Second) {
 		t.Error("the outgoing channel's started track satisfied the render gate")
 	}
 	// A new piid must.
 	a.setAudio(oldAndNew)
-	if !audioStarted(context.Background(), c, time.Second) {
+	if !audioStarted(context.Background(), c, base, time.Second) {
 		t.Error("a new started media piid did not confirm render")
 	}
 	// And with no baseline at all, fall back to identity-blind.
-	c.baseAudioPiids = nil
 	a.setAudio(oldOnly)
-	if !audioStarted(context.Background(), c, time.Second) {
+	if !audioStarted(context.Background(), c, nil, time.Second) {
 		t.Error("fallback without a baseline should accept any started media track")
+	}
+}
+
+// The render baseline must be taken at DETECTION time, inside waitForRender:
+// the outgoing channel's track starts after the tune's first polls on a
+// wake-resume box, so an early baseline would miss it and the old channel's
+// sound would read as render. The first dump is the baseline; only a track
+// that starts after it confirms.
+func TestRenderBaselineIsTakenAtDetectionTime(t *testing.T) {
+	oldOnly := `  AudioPlaybackConfiguration piid:111 type:android.media.AudioTrack u/pid:1/1 state:started attr:AudioAttributes: usage=USAGE_MEDIA content=CONTENT_TYPE_MOVIE`
+	a := hNewADB(t, hStep{ids: []string{"A"}})
+	a.setAudio(oldOnly) // the lingering old-channel track, running at detection
+	c := hConfig()
+	c.waitAudio = true
+	c.renderTimeout = 400 * time.Millisecond
+
+	start := time.Now()
+	log := hCaptureStderr(t, func() { waitForRender(context.Background(), c) })
+	took := time.Since(start)
+	if strings.Contains(log, "render confirmed") {
+		t.Fatalf("the old channel's lingering track confirmed render:\n%s", log)
+	}
+	if took < 350*time.Millisecond {
+		t.Errorf("returned in %v; want the full RENDER_TIMEOUT spent refusing the old track", took)
 	}
 }

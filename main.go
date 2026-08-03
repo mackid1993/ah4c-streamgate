@@ -95,12 +95,6 @@ type config struct {
 	waitAudio     bool
 	renderTimeout time.Duration
 	debug         bool
-
-	// Started media piids observed at tune start, snapshotted once alongside the
-	// codec baseline (only when WAIT_AUDIO is on). audioStarted compares against
-	// these so the outgoing channel's still-playing track cannot satisfy the
-	// render gate.
-	baseAudioPiids map[string]bool
 }
 
 // stdoutW is the stream sink. A var only so tests can substitute a buffer --
@@ -702,17 +696,6 @@ func waitForVideo(ctx context.Context, c *config) error {
 				baseIDs, baseSet = ids, setOf(ids)
 			}
 			baseSession = session
-			// The render gate needs its own identity baseline for the same reason
-			// the codec signal does. One extra adb call, once, only with the render
-			// gate enabled -- never on the polling hot path.
-			if c.waitAudio && c.baseAudioPiids == nil {
-				if dump := adbShell(ctx, c.tunerIP, "dumpsys audio", time.Until(deadline)); dump != "" {
-					c.baseAudioPiids = audioPiids(dump)
-					if c.debug {
-						logf(c, "audio baseline: %d started media piid(s)", len(c.baseAudioPiids))
-					}
-				}
-			}
 			if c.debug {
 				logf(c, "baseline codec=%s session=%s armed=%v (poll %d)",
 					orNone(strings.Join(baseIDs, ",")), session, armed, polls)
@@ -841,37 +824,53 @@ func audioPiids(dump string) map[string]bool {
 // had finished. Once the output is keyframe-aligned that slack disappears and
 // the pre-render frames become visible, which shows up as a blue/black flash at
 // the head of the recording.
-func audioStarted(ctx context.Context, c *config, budget time.Duration) bool {
+func audioStarted(ctx context.Context, c *config, base map[string]bool, budget time.Duration) bool {
 	dump := adbShell(ctx, c.tunerIP, "dumpsys audio", budget)
 	if dump == "" {
 		return false
 	}
 	started := audioPiids(dump)
-	// Without a baseline -- the snapshot probe failed, or an old dump format
-	// carries no piid -- fall back to identity-blind: any started media track.
-	// Weaker, but never worse than the pre-identity behaviour.
-	if len(c.baseAudioPiids) == 0 {
+	// Without a baseline -- its probe failed -- fall back to identity-blind:
+	// any started media track. Weaker, but never worse than the pre-identity
+	// behaviour.
+	if base == nil {
 		return len(started) > 0
 	}
 	for piid := range started {
-		if !c.baseAudioPiids[piid] {
+		if !base[piid] {
 			return true
 		}
 	}
 	return false
 }
 
-// waitForRender blocks until audio playback has actually started, bounding the
-// wait so a device that never reports it still tunes.
+// waitForRender blocks until audio playback for the NEW tune has actually
+// started, bounding the wait so a device that never reports it still tunes.
+//
+// The identity baseline is the FIRST dump, taken here at detection time -- not
+// earlier. Any track started at this instant is by definition not evidence of
+// the new tune rendering: the new HW_AV_SYNC track is still created-but-stopped
+// at decoder allocation (verified live), while a box that resumes the previous
+// channel on wake has the OLD channel's track running -- and that track starts
+// AFTER the tune's first polls, so a baseline taken back then would miss it and
+// the old channel's sound would read as render. Snapshotting at detection
+// excludes everything already playing, whoever it belongs to.
 func waitForRender(ctx context.Context, c *config) {
 	if !c.waitAudio {
 		return
 	}
 	start := time.Now()
 	deadline := start.Add(c.renderTimeout)
+	var base map[string]bool
+	if dump := adbShell(ctx, c.tunerIP, "dumpsys audio", time.Until(deadline)); dump != "" {
+		base = audioPiids(dump)
+		if c.debug {
+			logf(c, "render baseline: %d started media track(s)", len(base))
+		}
+	}
 	for time.Since(start) < c.renderTimeout {
-		if audioStarted(ctx, c, time.Until(deadline)) {
-			logf(c, "render confirmed after a further %dms (audio playback started)",
+		if audioStarted(ctx, c, base, time.Until(deadline)) {
+			logf(c, "render confirmed after a further %dms (new audio playback started)",
 				time.Since(start).Milliseconds())
 			return
 		}
