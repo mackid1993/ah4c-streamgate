@@ -154,18 +154,6 @@ adb -s <ip>:5555 shell "dumpsys media_session | grep -m1 PlaybackState"
 
 ---
 
-## Building
-
-CI builds on every push and publishes binaries on any `v*` tag. You can also run it by hand from the Actions tab — leave `release_tag` empty for artifacts only, or set it to cut a release.
-
-Locally:
-
-```sh
-CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o streamgate .
-```
-
----
-
 ## Thank you
 
 Thank you to [@sullrich](https://github.com/sullrich), [@bnhf](https://github.com/bnhf), and [@turtletank99](https://github.com/turtletank99) for the original `wait_for_video_playback_detection` idea in the excellent [ADBTuner](https://hub.docker.com/r/turtletank99/adbtuner).
