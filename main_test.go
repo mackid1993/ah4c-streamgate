@@ -703,30 +703,24 @@ func TestParserBounds(t *testing.T) {
 
 // rmWhole is the whole defence against a truncated resource dump becoming the
 // codec baseline, and replacing its body with `return true` used to leave the
-// entire suite green. An empty dump is believed only when it reached its
-// terminator, or when the latch has proven this build never prints one -- at
-// which point a complete probe IS the whole dump, so trust extends to the
-// empty list too (an idle box on such a build must not lose the codec signal).
+// entire suite green. A dump is believed only when it reached its terminator;
+// there is deliberately no fallback for builds that omit it -- every attempt to
+// serve that hypothetical class opened a wrong-channel path on real hardware.
 func TestRMWhole(t *testing.T) {
 	const term = "Processes:\n  Pid: 1\n    Id: A\n    {name: secure-codec, subType: video-codec, value: 1}\nEvents logs:\n"
 	const cut = "Processes:\n  Pid: 1\n    Id: A\n    {name: secure-codec, subType: video-codec, value: 1}\n  Pid: 2\n    Id: B"
 	cases := []struct {
-		name         string
-		rm           string
-		noTerminator bool
-		want         bool
+		name string
+		rm   string
+		want bool
 	}{
-		{"complete with terminator", term, false, true},
-		{"idle with terminator", "Processes:\nEvents logs:\n", false, true},
-		{"cut before the terminator, unlatched", cut, false, false},
-		{"cut before any decoder, unlatched", "Processes:\n  Pid: 1\n    Id:", false, false},
-		// Once the latch has proven the build prints no terminator, a complete
-		// probe is the whole dump by construction -- decoders listed or not.
-		{"no terminator, latched, with decoders", cut, true, true},
-		{"no terminator, latched, idle", "Processes:\n", true, true},
+		{"complete with terminator", term, true},
+		{"idle with terminator", "Processes:\nEvents logs:\n", true},
+		{"cut before the terminator", cut, false},
+		{"cut before any decoder", "Processes:\n  Pid: 1\n    Id:", false},
 	}
 	for _, c := range cases {
-		if got := rmWhole(c.rm, c.noTerminator); got != c.want {
+		if got := rmWhole(c.rm); got != c.want {
 			t.Errorf("%s: rmWhole = %v, want %v", c.name, got, c.want)
 		}
 	}

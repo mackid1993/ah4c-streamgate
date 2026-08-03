@@ -1478,19 +1478,18 @@ func TestCodecBaselineNeedsACompleteProbe(t *testing.T) {
 	}
 }
 
-// A vendor build that never prints the "Events logs" terminator used to lose
-// the codec signal entirely while idle: an empty decoder list could never be
-// believed, so no baseline ever locked and a decoder that then appeared had
-// nothing to be compared against. Once three consecutive complete polls have
-// proven the build prints no terminator, a complete probe IS the whole dump,
-// and the empty baseline locks -- so the new decoder fires the gate.
-func TestNoTerminatorBuildStillGetsCodecSignal(t *testing.T) {
-	idle := "Processes:\n  Pid: 100\n__MS__\n__MS2__\n"
-	play := "Processes:\n  Pid: 100\n    Id: NEW\n    {name: secure-codec, subType: video-codec, value: 1}\n__MS__\n__MS2__\n"
+// A vendor build that never prints the "Events logs" terminator gets NO codec
+// baseline -- deliberately. Every scheme that tried to trust terminator-less
+// dumps opened a wrong-channel path on real hardware, in exchange for a device
+// class nobody has ever observed. Such a build rides the session fallback,
+// which fails loud instead of recording the wrong channel.
+func TestNoTerminatorBuildRidesTheSessionFallback(t *testing.T) {
+	idle := "Processes:\n  Pid: 100\n__MS__\n" + hStopped + "\n__MS2__\n"
+	play := "Processes:\n  Pid: 100\n    Id: NEW\n    {name: secure-codec, subType: video-codec, value: 1}\n__MS__\n" + hPlaying + "\n__MS2__\n"
 	hNewADB(t,
 		hStep{raw: idle},
 		hStep{raw: idle},
-		hStep{raw: idle}, // the latch proves the format on poll 3
+		hStep{raw: idle},
 		hStep{raw: play},
 		hStep{raw: play},
 	)
@@ -1498,10 +1497,13 @@ func TestNoTerminatorBuildStillGetsCodecSignal(t *testing.T) {
 	c.tuneTimeout = 3 * time.Second
 	err, _, log := hWait(t, c)
 	if err != nil {
-		t.Fatalf("codec signal dead on a no-terminator build: %v\nlog:\n%s", err, log)
+		t.Fatalf("session fallback did not carry a no-terminator build: %v\nlog:\n%s", err, log)
 	}
-	if !strings.Contains(log, "via codec NEW") {
-		t.Errorf("want detection via the codec signal, got:\n%s", log)
+	if !strings.Contains(log, "via session playing") {
+		t.Errorf("want detection via the session fallback, got:\n%s", log)
+	}
+	if strings.Contains(log, "via codec") {
+		t.Errorf("a terminator-less dump must never lock a codec baseline:\n%s", log)
 	}
 }
 

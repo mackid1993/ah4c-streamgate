@@ -305,6 +305,14 @@ func loadConfig() (*config, error) {
 	if c.waitMotion && c.motionTimeout >= c.alignTimeout {
 		c.alignTimeout = c.motionTimeout + 2*time.Second
 	}
+	// Below 2, a single measurement window straddling the gate -- old picture on
+	// one side, card on the other -- can read as motion and release onto the
+	// card: measured at 3 of 4 runs with the drain disabled. 2 is structurally
+	// safe (one polluted window cannot be two consecutive).
+	if c.waitMotion && c.motionHold < 2 {
+		warnEnv("MOTION_HOLD", strconv.Itoa(c.motionHold), "below 2 a window straddling the gate can read as motion")
+		c.motionHold = 2
+	}
 	// The motion gate needs roughly 2+MOTION_HOLD measurement windows before it
 	// CAN fire: two to establish a floor, then MOTION_HOLD above it. Set
 	// MOTION_WINDOW large next to MOTION_TIMEOUT -- 1s against the 6s default is
@@ -547,8 +555,6 @@ func waitForVideo(ctx context.Context, c *config) error {
 		time.Sleep(c.poll)
 	}
 	sawPlaying := false
-	noTerminator, noTermPolls := false, 0
-	baseUnderLatch := false
 	var lastIDs []string
 	var lastSession, baseSession string
 	for {
@@ -633,29 +639,6 @@ func waitForVideo(ctx context.Context, c *config) error {
 		// tune on a box that simply has no resource manager. Different questions,
 		// separate flags.
 		rmLegible := strings.Contains(rm, "Processes:") || strings.Contains(rm, "Events logs")
-		// After enough legible dumps with no terminator, conclude this build does
-		// not print one rather than never locking a codec baseline at all.
-		if rmLegible && complete {
-			if !strings.Contains(rm, "Events logs") {
-				noTermPolls++
-				noTerminator = noTermPolls >= 3
-			} else {
-				// A terminator sighting disproves the latch outright: this build DOES
-				// print one, so the terminator-less dumps were dumpsys dying mid-dump,
-				// not a vendor format. Three of those in a row latched trust and
-				// locked an EMPTY baseline -- after which the outgoing channel's
-				// decoder read as new and the gate opened on it in under 200ms. The
-				// latch is withdrawn, and a baseline locked under it is thrown away so
-				// this same complete, terminated dump relocks it a few lines down,
-				// BEFORE the new-codec comparison runs.
-				noTermPolls = 0
-				noTerminator = false
-				if baseUnderLatch {
-					haveCodecBase = false
-					baseUnderLatch = false
-				}
-			}
-		}
 		// A transport that truncates is the fault the reconnect exists for, so it
 		// counts like one -- and it has to count on EVERY poll, not just before the
 		// baseline. Applying it only there meant 83 post-baseline truncated polls
@@ -676,7 +659,7 @@ func waitForVideo(ctx context.Context, c *config) error {
 		// One rule, one spelling, used at both sites below. They used to be written
 		// out twice and the two spellings differed -- the shape behind more of
 		// today's regressions than any other.
-		codecBaseOK := rmLegible && complete && rmWhole(rm, noTerminator)
+		codecBaseOK := rmLegible && complete && rmWhole(rm)
 
 		// The session has no identity, so it only counts once it has dropped at
 		// least once since we started -- otherwise a session left parked at state=3
@@ -711,7 +694,6 @@ func waitForVideo(ctx context.Context, c *config) error {
 			if codecBaseOK {
 				haveCodecBase = true
 				baseIDs, baseSet = ids, setOf(ids)
-				baseUnderLatch = noTerminator
 			}
 			baseSession = session
 			if c.debug {
@@ -728,7 +710,6 @@ func waitForVideo(ctx context.Context, c *config) error {
 		if !haveCodecBase && codecBaseOK {
 			haveCodecBase = true
 			baseIDs, baseSet = ids, setOf(ids)
-			baseUnderLatch = noTerminator
 			if c.debug {
 				logf(c, "codec baseline locked at poll %d: %s", polls, orNone(strings.Join(baseIDs, ",")))
 			}
@@ -1604,19 +1585,19 @@ func sectionComplete(pl []byte) bool {
 
 // rmWhole reports whether a resource dump can be trusted to have listed
 // EVERYTHING it has. "There was nothing to list" and "I was cut off before the
-// list" are identical to a substring test, so an empty dump is believed on one
-// of two grounds: it reached its terminator -- AOSP 11-16 all print "Events
-// logs" after the process list, verified against source and against the live
-// hardware -- or three consecutive complete polls have proven this build never
-// prints one, at which point a complete probe is the whole dump by construction
-// (the markers are echoed after it, and transport truncation is prefix loss).
+// list" are identical to a substring test, so a dump is believed only when it
+// reached its terminator -- AOSP 11 through 16 all print "Events logs" after
+// the process list, verified against source and against live hardware.
 //
-// Trusting an unterminated, unlatched dump installed an empty baseline, after
-// which the OUTGOING channel's decoder read as new and the gate opened on it.
-// The earlier per-poll corroboration schemes compared values that were empty by
-// construction and made this worse twice; the latch stays.
-func rmWhole(rm string, noTerminator bool) bool {
-	return strings.Contains(rm, "Events logs") || noTerminator
+// There is deliberately no fallback for a build that omits the terminator.
+// Three generations of machinery tried to serve that hypothetical device class
+// -- per-poll corroboration twice, then an adaptive trust latch -- and every
+// one of them opened a wrong-channel path on REAL hardware while the device
+// class it served has never been observed. If such a build exists, its codec
+// baseline never locks and detection rides the session fallback, which fails
+// LOUD (a dead tune the DVR retries) instead of recording the wrong channel.
+func rmWhole(rm string) bool {
+	return strings.Contains(rm, "Events logs")
 }
 
 // sameSet reports whether two pid sets are equal.
