@@ -29,6 +29,8 @@ CMD2=/opt/scripts/streamgate 2
 
 Restart the container. `TUNERn_IP` and `ENCODERn_URL` are read from the environment — there's nothing else to configure, and the defaults are meant to be good.
 
+Check both spellings. A missing `ENCODERn_URL` exits immediately, but a missing or misspelled `TUNERn_IP` is **not** fatal: that tuner logs `TUNERn_IP not set -- no gate` once and then streams ungated, so it records the head of the previous channel on every tune, indefinitely, with no other complaint.
+
 ---
 
 ## How `CMDn` works in ah4c
@@ -110,8 +112,11 @@ meaningless across encoders, resolutions and quality settings — one channel he
 runs real programming at 2,900 kbps where another runs 6,900. The floor is
 learned per stream, and the test is a ratio, so it travels.
 
-- **Warm tune, programming already flowing** — motion is already present, the
-  next keyframe is released immediately. Costs nothing.
+- **Warm tune, programming already flowing** — usually motion is already present
+  and the next keyframe is released immediately. Not guaranteed: the test is a
+  ratio to the quietest window ever seen, so a uniformly busy stream that never
+  dips has no rise to find and pays the full `MOTION_TIMEOUT`. The cost per tune
+  is anywhere between zero and that, depending on the content.
 - **Cold box, or an app that cold-starts with an intro** — the gate holds until
   the picture moves, then releases on the next keyframe. Only tunes that need it
   pay for it.

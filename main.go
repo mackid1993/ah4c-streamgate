@@ -262,7 +262,7 @@ func loadConfig() (*config, error) {
 	// MOTION_TIMEOUT must expire before the alignment fallback, or raising it
 	// silently disables BOTH gates and reports "no keyframe at all", which is a
 	// false statement about the encoder.
-	if c.motionTimeout >= c.alignTimeout {
+	if c.waitMotion && c.motionTimeout >= c.alignTimeout {
 		c.alignTimeout = c.motionTimeout + 2*time.Second
 	}
 	if c.encoderURL == "" {
@@ -467,6 +467,8 @@ func waitForVideo(ctx context.Context, c *config) error {
 	// as "not playing", which armed the fallback instantly.
 	haveBase := false
 	haveCodecBase := false
+	var pendingIDs []string
+	havePending := false
 	var baseIDs []string
 	var baseSet map[string]bool
 	armed := false
@@ -560,8 +562,18 @@ func waitForVideo(ctx context.Context, c *config) error {
 		rmLegible := strings.Contains(rm, "Processes:") || strings.Contains(rm, "Events logs")
 		// A truncated transport is a fault the reconnect exists for, so it has to
 		// keep counting toward consecFailures rather than resetting it.
+		// A transport that truncates is the fault the reconnect exists for, so it
+		// counts like one -- and it has to count on EVERY poll, not just before the
+		// baseline. Applying it only there meant 83 post-baseline truncated polls
+		// produced exactly one connect.
 		if complete {
 			consecFailures = 0
+		} else {
+			consecFailures++
+			if consecFailures >= 3 && time.Since(lastConnect) > 5*time.Second {
+				lastConnect = time.Now()
+				connect(time.Until(deadline))
+			}
 		}
 		// Completeness alone gates the timing/session baseline. Legibility of the
 		// resource half gates only the CODEC baseline, below -- a box that has no
@@ -574,14 +586,6 @@ func waitForVideo(ctx context.Context, c *config) error {
 				// it made the timeout blame the network for a box that replied to
 				// every poll.
 				illegible++
-				// A transport that truncates is the fault the reconnect exists for,
-				// so it has to count like one -- incrementing only on empty output
-				// meant pure truncation never reached it.
-				consecFailures++
-				if consecFailures >= 3 && time.Since(lastConnect) > 5*time.Second {
-					lastConnect = time.Now()
-					connect(time.Until(deadline))
-				}
 				time.Sleep(c.poll)
 				continue
 			}
@@ -591,8 +595,12 @@ func waitForVideo(ctx context.Context, c *config) error {
 			// outgoing channel's decoder look new -- and a permanent one cannot stop
 			// the session fallback from working.
 			if rmLegible {
-				haveCodecBase = true
-				baseIDs, baseSet = ids, setOf(ids)
+				if len(ids) > 0 {
+					haveCodecBase = true
+					baseIDs, baseSet = ids, setOf(ids)
+				} else {
+					pendingIDs, havePending = ids, true
+				}
 			}
 			// The session has no identity, so it only counts once it has dropped at
 			// least once since we started -- otherwise a session left parked at
@@ -619,11 +627,28 @@ func waitForVideo(ctx context.Context, c *config) error {
 		// No `continue`: falling through leaves the ids compared against a set that
 		// now contains them, so nothing fires, and the poll's arming and hits
 		// bookkeeping is not skipped.
+		// Two consecutive polls must agree before the codec baseline is locked.
+		// rmLegible cannot tell "I could not parse this dump" from "there was
+		// nothing to parse" -- both yield zero ids -- and a dumpsys that times out
+		// mid-dump still carries the "Processes:" header AND both probe markers.
+		// Installing an empty baseline from one of those makes the OUTGOING
+		// channel's decoder read as new, and the log is indistinguishable from a
+		// real detection. A transient truncation will not agree with the healthy
+		// poll after it; a genuinely idle box agrees with itself. Costs one poll,
+		// which MIN_WAIT covers.
 		if !haveCodecBase && rmLegible && complete {
-			haveCodecBase = true
-			baseIDs, baseSet = ids, setOf(ids)
-			if c.debug {
-				logf(c, "codec baseline deferred to poll %d: %s", polls, orNone(strings.Join(baseIDs, ",")))
+			// Only the EMPTY parse is ambiguous, so only it needs corroborating. A
+			// dump that lists decoders plainly parsed, and delaying that would let
+			// the baseline absorb the new channel's decoder -- a worse bug than the
+			// one being fixed.
+			if len(ids) > 0 || (havePending && len(pendingIDs) == 0) {
+				haveCodecBase = true
+				baseIDs, baseSet = ids, setOf(ids)
+				if c.debug {
+					logf(c, "codec baseline locked at poll %d: %s", polls, orNone(strings.Join(baseIDs, ",")))
+				}
+			} else {
+				pendingIDs, havePending = ids, true
 			}
 		}
 
@@ -1298,8 +1323,9 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) error {
 		// up none of it is queued: otherwise the flush below shovelled thousands of
 		// stuffing bytes at the DVR and only reported "encoder sent no video" at
 		// EOF, long after the bytes had gone.
-		picture := p != 0x1fff && p != 0 && !pmtPids[p]
-		if !wrote && !picture {
+		// Only evaluated until the first real packet: after that `wrote` is true
+		// and the map lookup would run on every packet for the whole recording.
+		if !wrote && (p == 0x1fff || p == 0 || pmtPids[p]) {
 			continue
 		}
 		batch = append(batch, pkt...)
@@ -1401,6 +1427,20 @@ func psiPayload(pkt []byte, wantTable byte) []byte {
 // the DVR would get a fragment it can never reach the CRC of.
 func sectionComplete(pl []byte) bool {
 	return 3+(int(pl[1]&0x0f)<<8|int(pl[2])) <= len(pl)
+}
+
+// sameIDs reports whether two id lists name the same set.
+func sameIDs(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	sb := setOf(b)
+	for _, id := range a {
+		if !sb[id] {
+			return false
+		}
+	}
+	return true
 }
 
 // sameSet reports whether two pid sets are equal.
