@@ -1449,3 +1449,32 @@ func TestCutShortSessionDoesNotArm(t *testing.T) {
 		t.Fatalf("gate opened on a session that never dropped; log:\n%s", log)
 	}
 }
+
+// The codec-baseline rule needs `complete` as well as legible. A probe cut short
+// after the resource dump still carries "Processes:" and "Events logs", so it
+// reads as both legible and whole -- but the decoder list may be a fragment, and
+// every omitted id then reads as new. Dropping `complete` from that rule used to
+// leave the whole suite green.
+func TestCodecBaselineNeedsACompleteProbe(t *testing.T) {
+	// Poll 1 completes but its resource half is unreadable, so the timing
+	// baseline is taken and the codec baseline is deferred. Poll 2 is cut before
+	// __MS__ -- legible and terminated, so it looks whole, but it names only the
+	// first of the box's two pre-existing decoders. Accepting it would make OLDB
+	// read as new on poll 3 and open the gate on the channel being left.
+	partial := "Processes:\n  Pid: 1\n    Id: OLDA\n    {name: secure-codec, subType: video-codec, value: 1}\nEvents logs:\n"
+	hNewADB(t,
+		hStep{raw: "Can't find service: media.resource_manager\n__MS__\n" + hStopped + "\n__MS2__\n"},
+		hStep{raw: partial},
+		hStep{ids: []string{"OLDA", "OLDB"}, session: hStopped},
+		hStep{ids: []string{"OLDA", "OLDB"}, session: hStopped},
+	)
+	c := hConfig()
+	c.tuneTimeout = 900 * time.Millisecond
+	err, _, log := hWait(t, c)
+	if err == nil {
+		t.Fatalf("gate opened on the outgoing channel; log:\n%s", log)
+	}
+	if strings.Contains(log, "via codec") {
+		t.Errorf("an incomplete probe was accepted as the codec baseline:\n%s", log)
+	}
+}

@@ -597,6 +597,26 @@ func waitForVideo(ctx context.Context, c *config) error {
 		// resource half gates only the CODEC baseline, below -- a box that has no
 		// resource manager must still be able to tune on the session fallback,
 		// and requiring a legible dump here failed every tune on one.
+		// One rule, one spelling, used at both sites below. They used to be written
+		// out twice and the two spellings differed -- the shape behind more of
+		// today's regressions than any other.
+		codecBaseOK := rmLegible && complete && rmWhole(rm, ids, noTerminator)
+
+		// The session has no identity, so it only counts once it has dropped at
+		// least once since we started -- otherwise a session left parked at state=3
+		// by the previous channel reads as instant success. Only a session we could
+		// actually read may arm it: mediaSessionState cannot tell "stopped" from
+		// "could not be parsed".
+		//
+		// Hoisted to one site. `armed` starts false and the baseline branch runs
+		// exactly once, so `armed = X` there and `if X { armed = true }` here are
+		// the same statement; the switch below tests `armed` only in the
+		// session=="playing" case, which is mutually exclusive with this one, so
+		// latching before it cannot change any poll's verdict.
+		if sessionRead && session != "playing" {
+			armed = true
+		}
+
 		if !haveBase {
 			if !complete {
 				// Waiting costs a poll; accepting opens the gate on the old channel.
@@ -608,23 +628,14 @@ func waitForVideo(ctx context.Context, c *config) error {
 				continue
 			}
 			haveBase = true
-			// The codec baseline is only taken from a legible resource dump, and
-			// separately from this one, so a transient failure cannot make the
-			// outgoing channel's decoder look new -- and a permanent one cannot stop
-			// the session fallback from working.
-			if rmLegible && rmWhole(rm, ids, noTerminator) {
+			// The codec baseline is taken separately from the timing one, so a
+			// transient resource-manager failure cannot make the outgoing channel's
+			// decoder look new, and a permanent one cannot stop the session fallback
+			// from working.
+			if codecBaseOK {
 				haveCodecBase = true
 				baseIDs, baseSet = ids, setOf(ids)
 			}
-			// The session has no identity, so it only counts once it has dropped at
-			// least once since we started -- otherwise a session left parked at
-			// state=3 by the previous channel reads as instant success.
-			//
-			// Same rule as the loop below, and it matters MORE here: this is the
-			// poll the whole tune is measured against. An unreadable session half
-			// used to arm it, and the next poll then opened the gate on the channel
-			// we were leaving.
-			armed = sessionRead && session != "playing"
 			baseSession = session
 			if c.debug {
 				logf(c, "baseline codec=%s session=%s armed=%v (poll %d)",
@@ -634,17 +645,10 @@ func waitForVideo(ctx context.Context, c *config) error {
 			continue
 		}
 
-		// `complete` as well as legible, the same rule the first-poll baseline
-		// applies. A probe cut short mid-dump still carries the "Processes:"
-		// header, so it reads as legible while listing fewer decoders than the box
-		// has -- and every omitted id then reads as new on the next healthy poll.
 		// No `continue`: falling through leaves the ids compared against a set that
-		// now contains them, so nothing fires, and the poll's arming and hits
-		// bookkeeping is not skipped.
-		// rmLegible cannot tell "I could not parse this dump" from "there was
-		// nothing to parse" -- both yield zero ids -- so rmWhole decides it
-		// structurally, within the poll, rather than by comparing polls.
-		if !haveCodecBase && rmLegible && complete && rmWhole(rm, ids, noTerminator) {
+		// now contains them, so nothing fires, and the poll's hits bookkeeping is
+		// not skipped.
+		if !haveCodecBase && codecBaseOK {
 			haveCodecBase = true
 			baseIDs, baseSet = ids, setOf(ids)
 			if c.debug {
@@ -663,14 +667,6 @@ func waitForVideo(ctx context.Context, c *config) error {
 		case session == "playing" && armed:
 			playing, via = true, "session playing"
 		}
-		// Only a session we could actually read may arm the fallback.
-		// mediaSessionState cannot tell "stopped" from "could not be parsed", so a
-		// single truncated half used to arm the gate and let the previous
-		// channel's parked state=3 open it on the next poll.
-		if sessionRead && session != "playing" {
-			armed = true
-		}
-
 		if c.debug {
 			logf(c, "t=%.1fs codec=%s base=%s session=%s armed=%v hits=%d playing=%v",
 				elapsed.Seconds(), orNone(strings.Join(ids, ",")),
@@ -1001,6 +997,18 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) (wrote boo
 	}
 
 	var lastPAT, lastPMT []byte
+	// One helper, three release paths: ALIGN_KEYFRAME=0, the ALIGN_TIMEOUT
+	// fallback, and alignment succeeding. Written out three times, one copy was
+	// simply missing -- the DVR then waited for the encoder's next PSI cycle in
+	// that mode, delivering strictly less than a plain byte copy.
+	injectTables := func() {
+		if lastPAT != nil {
+			batch = append(batch, lastPAT...)
+		}
+		if lastPMT != nil {
+			batch = append(batch, lastPMT...)
+		}
+	}
 	pmtPids := map[uint16]bool{}
 	vidPids := map[uint16]bool{}
 	vidByPMT := map[uint16]map[uint16]bool{}
@@ -1040,16 +1048,11 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) (wrote boo
 				draining = c.drainIdle > 0
 				if !c.alignKey {
 					aligned = true
-					// The same reasoning as the ALIGN_TIMEOUT fallback: without this
-					// the DVR waits for the encoder's next PSI cycle, and the !wrote
+					// Same reasoning as the ALIGN_TIMEOUT fallback: without this the
+					// DVR waits for the encoder's next PSI cycle, and the !wrote
 					// guard drops the stream's own leading tables on the way past --
-					// so this mode delivered strictly less than curl would.
-					if lastPAT != nil {
-						batch = append(batch, lastPAT...)
-					}
-					if lastPMT != nil {
-						batch = append(batch, lastPMT...)
-					}
+					// so this mode delivered strictly less than a plain byte copy.
+					injectTables()
 				}
 				// Opt-in. Everything measured before the gate came off a DIFFERENT
 				// picture -- usually the channel we are leaving -- so a rise seen
@@ -1082,12 +1085,7 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) (wrote boo
 			logf(c, "no keyframe recognised within %s; streaming unaligned (encoder may not signal random access -- try ALIGN_KEYFRAME=0)", c.alignTimeout+relaxWindow)
 			// Still send the tables, otherwise the DVR has to wait for the
 			// encoder's next PSI cycle on top of everything else.
-			if lastPAT != nil {
-				batch = append(batch, lastPAT...)
-			}
-			if lastPMT != nil {
-				batch = append(batch, lastPMT...)
-			}
+			injectTables()
 		}
 
 		var readStart time.Time
@@ -1329,12 +1327,7 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) (wrote boo
 				p, discarded, float64(discarded*tsPacketSize)/1024,
 				float64(drained*tsPacketSize)/1024,
 				time.Since(gateAt).Seconds(), path)
-			if lastPAT != nil {
-				batch = append(batch, lastPAT...)
-			}
-			if lastPMT != nil {
-				batch = append(batch, lastPMT...)
-			}
+			injectTables()
 		}
 
 		// Null padding and the tables are not a picture. An encoder that is muxing
