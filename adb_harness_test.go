@@ -1033,8 +1033,7 @@ func TestSecureCodecIDsLeaksIDAcrossProcesses(t *testing.T) {
 `
 	got := secureCodecIDs(dump)
 	if len(got) == 1 && got[0] == "LAUNCHER" {
-		t.Log("BUG main.go:295: the codec in pid 2000 was reported under pid 1000's id")
-		return
+		t.Fatal("the codec in pid 2000 was reported under pid 1000's id")
 	}
 	if len(got) != 0 {
 		t.Errorf("secureCodecIDs = %v", got)

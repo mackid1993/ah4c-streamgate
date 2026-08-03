@@ -212,7 +212,7 @@ When the gate can't confirm anything:
 ```
 streamgate[1]: aligned video-pid=100 discarded=412 packets/76KB caught-up=0KB gate-to-air=6.05s waited-for-motion=6s(timeout, released anyway) keyframes-skipped=2
 streamgate[1]: no keyframe recognised within 10s; streaming unaligned (encoder may not signal random access -- try ALIGN_KEYFRAME=0)
-streamgate[1]: no playback after 40s (adb ok on 158/160 polls, base=none) -- device reported no secure decoder and no playing media session
+streamgate[1]: no playback after 40s (adb ok on 158/160 polls) -- nothing changed: baseline codec=none session=stopped, last poll codec=none session=stopped
 ```
 
 `DEBUG=1` adds a line per poll showing both detection signals and the arming state.

@@ -61,6 +61,9 @@ const (
 	// 20000 packets. A user writing DRAIN_IDLE=1 gets one second, not one
 	// microsecond, and loses the whole recording to "encoder sent no video".
 	maxDrainTime = 2 * time.Second
+	// Redials permitted after the gate has opened. Unbounded would leave the DVR
+	// waiting on an encoder that is never coming back.
+	maxPostGateDials = 3
 	// After ALIGN_TIMEOUT we stop insisting on motion and take any keyframe;
 	// this is the extra grace before giving up on alignment entirely.
 	relaxWindow = 2 * time.Second
@@ -130,13 +133,21 @@ func env(k, def string) string {
 
 // envBool accepts the usual spellings instead of "anything except 0".
 func envBool(k string, def bool) bool {
-	switch strings.ToLower(envRaw(k)) {
+	v := envRaw(k)
+	switch strings.ToLower(v) {
 	case "":
 		return def
-	case "0", "false", "no", "off":
+	case "0", "false", "no", "n", "off", "disable", "disabled":
 		return false
-	default:
+	case "1", "true", "yes", "y", "on", "enable", "enabled":
 		return true
+	default:
+		// The README promises an unparseable value is ignored with a warning, not
+		// silently accepted. "anything else is true" turned REARM_MOTION=n -- a
+		// perfectly reasonable way to type "off" -- into ON, which pays the whole
+		// MOTION_TIMEOUT on every retune that shows no loading card.
+		warnEnv(k, v, "want 1/0, true/false, yes/no or on/off")
+		return def
 	}
 }
 
@@ -896,15 +907,27 @@ func (c *idleTimeoutConn) Read(b []byte) (int, error) {
 // 40s, and an HDMI resync on the channel change is enough to trip it. Nothing is
 // lost by redialling: before the gate every byte is discarded anyway.
 func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
+	postGate := 0
 	for attempt := 1; ; attempt++ {
-		err := streamOnce(ctx, c, gate)
+		wrote, err := streamOnce(ctx, c, gate)
+		// `wrote`, not the gate. streamOnce is blocked inside readPacket for up to
+		// READ_TIMEOUT -- 10s at the default, inside a 40s TUNE_TIMEOUT -- and
+		// cannot observe the gate while it is. A gate that opened anywhere in that
+		// window was therefore seen only after the read failed, and a failure that
+		// emitted nothing was then classified as "this was the recording" and the
+		// tune died with zero bytes. That is the exact case redialling exists for.
+		if wrote || ctx.Err() != nil {
+			return err
+		}
+		// Once the gate is open the DVR is waiting, so redialling is bounded: a
+		// permanently dead encoder must fail the tune rather than hold it open.
 		select {
 		case <-gate:
-			return err // the gate is open: this was the recording
+			postGate++
+			if postGate > maxPostGateDials {
+				return err
+			}
 		default:
-		}
-		if ctx.Err() != nil {
-			return err
 		}
 		logf(c, "encoder unavailable before the gate opened (attempt %d: %v); redialling", attempt, err)
 		select {
@@ -917,10 +940,10 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 	}
 }
 
-func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) error {
+func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) (wrote bool, err error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", c.encoderURL, nil)
 	if err != nil {
-		return err
+		return false, err
 	}
 	// Two different hangs have to be closed off here.
 	//
@@ -949,14 +972,13 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) error {
 	}
 	resp, err := (&http.Client{Transport: tr}).Do(req)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("encoder returned %s", resp.Status)
+		return false, fmt.Errorf("encoder returned %s", resp.Status)
 	}
 
-	wrote := false
 	sent := 0
 	// 8KB, not 64KB. Whatever sits in this buffer is video we have taken off the
 	// socket but not yet emitted, so its size is a ceiling on how far behind live
@@ -1084,18 +1106,18 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) error {
 			// first put those bytes on the wire for a tune that then reported it had
 			// sent no video. Nothing goes out on a tune that carried no picture.
 			if !wrote {
-				return fmt.Errorf("encoder sent no video (%v)", err)
+				return wrote, fmt.Errorf("encoder sent no video (%v)", err)
 			}
 			// Prefer a failed final flush to the read error: if the DVR hung up, that
 			// is the real reason we are here and main treats it as the normal end of
 			// a recording, where blaming the encoder logged a false failure.
 			if ferr := flush(); ferr != nil {
-				return ferr
+				return wrote, ferr
 			}
 			// The encoder ending the stream mid-recording is a failure however
 			// politely it closes. Reporting io.EOF as success truncated recordings
 			// with no log line at all.
-			return fmt.Errorf("encoder ended the stream after %s and %.1f MB (%v)",
+			return wrote, fmt.Errorf("encoder ended the stream after %s and %.1f MB (%v)",
 				time.Since(gateAt).Round(time.Second), float64(sent)/(1<<20), err)
 		}
 		if draining {
@@ -1335,7 +1357,7 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) error {
 		// of the syscalls.
 		if br.Buffered() < tsPacketSize || len(batch)+tsPacketSize > cap(batch) {
 			if err := flush(); err != nil {
-				return err
+				return wrote, err
 			}
 		}
 	}
