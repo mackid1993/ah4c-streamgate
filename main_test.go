@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"net/http"
@@ -722,5 +723,38 @@ func TestRMWhole(t *testing.T) {
 		if got := rmWhole(c.rm, c.ids, c.noTerminator); got != c.want {
 			t.Errorf("%s: rmWhole = %v, want %v", c.name, got, c.want)
 		}
+	}
+}
+
+// The 188-byte sync-grid check is the sole defence against a false lock
+// splicing an entire recording, and removing it left the whole suite green.
+// A body with ~1-in-256 sync-byte density and no grid must not be mistaken for
+// video on the strength of one 0x47.
+func TestReadPacketRejectsAFalseSyncLock(t *testing.T) {
+	// 0x47 every 100 bytes and nowhere else. 188 is not a multiple of 100, so no
+	// two candidates are one packet apart and no grid exists anywhere.
+	body := make([]byte, 12000)
+	for i := range body {
+		body[i] = 0x11
+	}
+	for i := 0; i < len(body); i += 100 {
+		body[i] = 0x47
+	}
+	br := bufio.NewReaderSize(bytes.NewReader(body), 1<<13)
+	pkt := make([]byte, tsPacketSize)
+	relaxed, warned := false, false
+
+	// Every accepted packet must have landed on a real grid position, i.e. the
+	// byte one packet later is also 0x47. Before relaxation, none can.
+	for !relaxed {
+		if err := readPacket(br, pkt, &relaxed, func() { warned = true }); err != nil {
+			break
+		}
+		if !relaxed {
+			t.Fatal("locked onto a lone 0x47 with no 188-byte grid behind it")
+		}
+	}
+	if !relaxed || !warned {
+		t.Errorf("relaxed=%v warned=%v; want the scan limit to relax and warn rather than stall", relaxed, warned)
 	}
 }

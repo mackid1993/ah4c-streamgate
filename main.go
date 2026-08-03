@@ -891,6 +891,12 @@ func (c *idleTimeoutConn) Read(b []byte) (int, error) {
 // detected and the encoder was healthy again. READ_TIMEOUT is 10s inside that
 // 40s, and an HDMI resync on the channel change is enough to trip it. Nothing is
 // lost by redialling: before the gate every byte is discarded anyway.
+// errNoPicture is terminal, not retryable: the encoder answered and kept
+// answering, there is simply nothing to record. Routing it through the redial
+// path re-paid the entire align window on every attempt -- ~81s of a held tuner
+// slot at the defaults, for a verdict already reached in 10.
+var errNoPicture = errors.New("no picture")
+
 func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 	postGate := 0
 	for attempt := 1; ; attempt++ {
@@ -901,7 +907,7 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 		// window was therefore seen only after the read failed, and a failure that
 		// emitted nothing was then classified as "this was the recording" and the
 		// tune died with zero bytes. That is the exact case redialling exists for.
-		if wrote || ctx.Err() != nil {
+		if wrote || ctx.Err() != nil || errors.Is(err, errNoPicture) {
 			return err
 		}
 		// Once the gate is open the DVR is waiting, so redialling is bounded: a
@@ -1337,7 +1343,13 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) (wrote boo
 		// EOF, long after the bytes had gone.
 		// Only evaluated until the first real packet: after that `wrote` is true
 		// and the map lookup would run on every packet for the whole recording.
-		if !wrote && (p == 0x1fff || p == 0 || pmtPids[p]) {
+		// When the PMT named the video pids, require one of them; otherwise fall
+		// back to excluding what is definitely not picture.
+		notPicture := p == 0x1fff || p == 0 || pmtPids[p]
+		if len(vidPids) > 0 {
+			notPicture = !vidPids[p]
+		}
+		if !wrote && notPicture {
 			// Bounded. Suppressing padding until a real packet arrives is right, but
 			// nothing here made that wait finite: READ_TIMEOUT is idle-only, so an
 			// encoder muxing with no HDMI input keeps the deadline pushed out with
@@ -1345,8 +1357,8 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) (wrote boo
 			// zero bytes, no log and no exit, while the DVR waited on a pipe that
 			// would never carry a byte. Failing loudly is strictly better.
 			if aligned && !noVideoAt.IsZero() && time.Since(noVideoAt) > c.readTimeout {
-				return wrote, fmt.Errorf("encoder sent only null padding and program tables for %v -- no picture (is anything connected to its HDMI input?)",
-					c.readTimeout)
+				return wrote, fmt.Errorf("encoder sent no picture for %v, only padding and tables (is anything connected to its HDMI input?): %w",
+					c.readTimeout, errNoPicture)
 			}
 			if aligned && noVideoAt.IsZero() {
 				noVideoAt = time.Now()
