@@ -12,7 +12,7 @@ The video is never re-encoded. The encoder's bytes go through untouched.
 
 ## Install
 
-Download a binary from [Releases](../../releases) — `linux-amd64`, `linux-arm64`, or `linux-armv7`. They're static, so they run inside the ah4c container with no dependencies.
+Download a binary from [Releases](../../releases) — `linux-amd64`, `linux-arm64`, or `linux-armv7`. They're statically linked, so there's nothing to install alongside them. They do call `adb`, which the ah4c image already ships.
 
 ```sh
 curl -fsSL -o /path/to/ah4c/scripts/streamgate \
@@ -120,12 +120,19 @@ optimisation:
 - No rise within `MOTION_TIMEOUT` — release anyway. Covers a constant-bitrate
   encoder, where there is no rise to detect, and a box that was never slept so
   programming was already running before we connected.
-- No keyframe within `ALIGN_TIMEOUT` — take any keyframe.
-- Still nothing 2s later — stream unaligned rather than produce no output at all.
+- No keyframe within `ALIGN_TIMEOUT` + 2s — stream unaligned rather than produce no output at all. The cached PAT/PMT are still sent first, so the DVR does not additionally wait for the encoder's next table cycle.
 
 ## Settings
 
-All optional, all environment variables. The defaults are tuned; most people should never touch these.
+All optional, all environment variables, set on the **ah4c container** (streamgate inherits its environment). Durations accept either seconds (`5`, `0.25`) or Go syntax (`10s`, `250ms`). A value that can't be parsed is ignored with a warning on stderr rather than silently falling back.
+
+Note these apply to **every tuner**. If you need one tuner to differ — say a different app with a longer intro — set it on that tuner's command instead:
+
+```
+CMD6=/usr/bin/env MOTION_TIMEOUT=12s /opt/scripts/streamgate 6
+```
+
+The defaults are tuned; most people should never touch these.
 
 | Variable | Default | What it does |
 |---|---|---|
@@ -137,7 +144,7 @@ All optional, all environment variables. The defaults are tuned; most people sho
 | `TUNE_TIMEOUT` | `40` | Give up after this long. Costs nothing on a tune that works — the wait ends the moment playback is detected. |
 | `ON_TIMEOUT` | `fail` | `fail` exits without streaming, so your DVR sees a dead tune and can retry or pick another tuner. Anything else streams whatever is on screen. |
 | `ALIGN_KEYFRAME` | `1` | Start output on a keyframe. `0` streams from wherever the encoder happens to be. |
-| `ALIGN_TIMEOUT` | `5` | If no keyframe is recognised within this long, stream unaligned rather than stall. |
+| `ALIGN_TIMEOUT` | `8` | If no keyframe is recognised within this long, stream unaligned rather than stall. Automatically raised above `MOTION_TIMEOUT` if you set them so they'd conflict. |
 | `WAIT_AUDIO` | `0` | After the decoder appears, also wait for audio playback to start. Costs ~0.7s. Only needed if a flash survives `SETTLE`. |
 | `RENDER_TIMEOUT` | `3` | Cap on that wait, so a device that never reports audio still tunes. |
 | `WAIT_MOTION` | `1` | Wait for the picture to start moving before releasing. `0` releases on the first keyframe. |
@@ -208,7 +215,7 @@ adb -s <ip>:5555 shell dumpsys media.resource_manager
 adb -s <ip>:5555 shell "dumpsys media_session | grep -m1 PlaybackState"
 ```
 
-**Tunes are slower than they used to be.** Only `SETTLE` and `WAIT_AUDIO` add deliberate delay; everything else ends the moment playback is detected. Run with `DEBUG=1` and compare `playback detected after Ns` against how long the tune felt — the difference is downstream of this program.
+**Tunes are slower than they used to be.** Four things add deliberate delay after playback is detected: `SETTLE` (0.25s), the motion gate (up to `MOTION_TIMEOUT`), keyframe alignment (up to `ALIGN_TIMEOUT` + 2s), and `WAIT_AUDIO` if you enabled it. The `aligned` log line breaks this down — `gate-to-air` is the total and `waited-for-motion` is the motion gate's share. If `gate-to-air` is small and the tune still felt slow, the time went somewhere downstream of this program.
 
 **A flash at the head of the recording.** See above — raise `SETTLE`.
 

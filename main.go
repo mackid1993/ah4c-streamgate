@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -43,8 +44,6 @@ const (
 	// After ALIGN_TIMEOUT we stop insisting on motion and take any keyframe;
 	// this is the extra grace before giving up on alignment entirely.
 	relaxWindow = 2 * time.Second
-	// A hold shorter than this is not a wait worth calling a slow path.
-	happyHold = 400 * time.Millisecond
 )
 
 type config struct {
@@ -74,41 +73,92 @@ func logf(c *config, format string, a ...interface{}) {
 	fmt.Fprintf(os.Stderr, "streamgate[%s]: %s\n", c.tuner, fmt.Sprintf(format, a...))
 }
 
+// envRaw trims whitespace and strips surrounding quotes. Docker --env-file does
+// not strip quotes and env files routinely carry trailing spaces, so a value
+// written as ON_TIMEOUT="fail" arrives with the quotes attached. Comparing that
+// literally silently disabled the fail-safe.
+func envRaw(k string) string {
+	v := strings.TrimSpace(os.Getenv(k))
+	if len(v) >= 2 {
+		q := v[0]
+		if (q == 0x22 || q == 0x27) && v[len(v)-1] == q {
+			v = v[1 : len(v)-1]
+		}
+	}
+	return strings.TrimSpace(v)
+}
+
 func env(k, def string) string {
-	if v := os.Getenv(k); v != "" {
+	if v := envRaw(k); v != "" {
 		return v
 	}
 	return def
 }
 
+// envBool accepts the usual spellings instead of "anything except 0".
+func envBool(k string, def bool) bool {
+	switch strings.ToLower(envRaw(k)) {
+	case "":
+		return def
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+// envDur accepts a bare number of seconds ("5", "0.25") or Go duration syntax
+// ("10s", "250ms"). Users of a Go program reasonably type the latter, and
+// silently falling back to the default made misconfiguration invisible.
 func envDur(k string, def time.Duration) time.Duration {
-	v := os.Getenv(k)
+	v := envRaw(k)
 	if v == "" {
 		return def
 	}
+	if d, err := time.ParseDuration(v); err == nil {
+		if d <= 0 {
+			warnEnv(k, v, "must be positive")
+			return def
+		}
+		return d
+	}
 	f, err := strconv.ParseFloat(v, 64)
-	if err != nil {
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f <= 0 {
+		warnEnv(k, v, "want seconds (5, 0.25) or a duration (10s, 250ms)")
 		return def
 	}
 	return time.Duration(f * float64(time.Second))
 }
 
 func envFloat(k string, def float64) float64 {
-	if v := os.Getenv(k); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			return f
-		}
+	v := envRaw(k)
+	if v == "" {
+		return def
 	}
-	return def
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f <= 0 {
+		warnEnv(k, v, "want a positive number")
+		return def
+	}
+	return f
 }
 
 func envInt(k string, def int) int {
-	if v := os.Getenv(k); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
+	v := envRaw(k)
+	if v == "" {
+		return def
 	}
-	return def
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		warnEnv(k, v, "want a non-negative whole number")
+		return def
+	}
+	return n
+}
+
+// warnEnv makes a bad setting visible rather than silently using the default.
+func warnEnv(k, v, why string) {
+	fmt.Fprintf(os.Stderr, "streamgate: ignoring %s=%q -- %s; using the default\n", k, v, why)
 }
 
 func loadConfig() (*config, error) {
@@ -130,17 +180,23 @@ func loadConfig() (*config, error) {
 		// frames and showing a brief blue/black flash at the head of a recording.
 		// Far cheaper than waiting for the render signal proper (~0.7s).
 		settle:        envDur("SETTLE", 250*time.Millisecond),
-		onTimeout:     env("ON_TIMEOUT", "fail"),
-		alignKey:      env("ALIGN_KEYFRAME", "1") != "0",
+		onTimeout:     strings.ToLower(env("ON_TIMEOUT", "fail")),
+		alignKey:      envBool("ALIGN_KEYFRAME", true),
 		alignTimeout:  envDur("ALIGN_TIMEOUT", 8*time.Second),
-		waitMotion:    env("WAIT_MOTION", "1") != "0",
+		waitMotion:    envBool("WAIT_MOTION", true),
 		motionTimeout: envDur("MOTION_TIMEOUT", 6*time.Second),
 		riseFactor:    envFloat("RISE_FACTOR", 5.0),
 		motionHold:    envInt("MOTION_HOLD", 3),
 		motionWindow:  envDur("MOTION_WINDOW", 250*time.Millisecond),
-		waitAudio:     env("WAIT_AUDIO", "0") != "0",
+		waitAudio:     envBool("WAIT_AUDIO", false),
 		renderTimeout: envDur("RENDER_TIMEOUT", 3*time.Second),
-		debug:         os.Getenv("DEBUG") != "",
+		debug:         envBool("DEBUG", false),
+	}
+	// MOTION_TIMEOUT must expire before the alignment fallback, or raising it
+	// silently disables BOTH gates and reports "no keyframe at all", which is a
+	// false statement about the encoder.
+	if c.motionTimeout >= c.alignTimeout {
+		c.alignTimeout = c.motionTimeout + 2*time.Second
 	}
 	if c.encoderURL == "" {
 		return nil, fmt.Errorf("ENCODER%s_URL not set", n)
@@ -160,6 +216,7 @@ func secureCodecID(dump string) string {
 	lines := strings.Split(dump, "\n")
 	inProc := false
 	id := ""
+	found := ""
 	for _, line := range lines {
 		t := strings.TrimSpace(line)
 		if strings.HasPrefix(t, "Process Pid override") || strings.HasPrefix(t, "Events logs") {
@@ -178,11 +235,15 @@ func secureCodecID(dump string) string {
 		l := strings.ToLower(line)
 		if strings.Contains(l, "video-codec") || strings.Contains(l, "videocodec") {
 			if !strings.Contains(l, "non-secure") && strings.Contains(l, "secure") {
-				return id
+				// Keep scanning. An in-place channel switch leaves the previous
+				// decoder allocated alongside the new one, and it is listed first,
+				// so returning the first match reports the OLD id and the "changed
+				// id" test never fires.
+				found = id
 			}
 		}
 	}
-	return ""
+	return found
 }
 
 // mediaSessionState reads the top media session. Fallback for devices where the
@@ -246,13 +307,26 @@ func waitForVideo(ctx context.Context, c *config) error {
 
 	start := time.Now()
 	hits := 0
+	adbFailures, polls := 0, 0
 	for {
 		elapsed := time.Since(start)
 		if elapsed >= c.tuneTimeout {
-			return fmt.Errorf("no playback after %ds (base=%s)", int(elapsed.Seconds()), orNone(base))
+			// Say WHICH failure this was. adb being unreachable and the box simply
+			// not playing produced the same message, which is undiagnosable.
+			if polls > 0 && adbFailures == polls {
+				return fmt.Errorf("no playback after %ds -- every adb call to %s failed or returned nothing (is adb reachable? does TUNER%s_IP include :5555?)",
+					int(elapsed.Seconds()), c.tunerIP, c.tuner)
+			}
+			return fmt.Errorf("no playback after %ds (adb ok on %d/%d polls, base=%s) -- device reported no secure decoder and no playing media session",
+				int(elapsed.Seconds()), polls-adbFailures, polls, orNone(base))
 		}
+		polls++
 
-		rm, ms := split(adbShell(ctx, c.tunerIP, probe))
+		raw := adbShell(ctx, c.tunerIP, probe)
+		if raw == "" {
+			adbFailures++
+		}
+		rm, ms := split(raw)
 		id := secureCodecID(rm)
 		session := mediaSessionState(ms)
 
@@ -460,10 +534,14 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 	if err != nil {
 		return err
 	}
+	// Without a response-header timeout an encoder that accepts the TCP
+	// connection but never replies parks here forever, with no log and no exit,
+	// while the DVR waits.
 	tr := &http.Transport{
-		DialContext:         (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
-		DisableCompression:  true,
-		MaxIdleConnsPerHost: 1,
+		DialContext:           (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+		ResponseHeaderTimeout: 10 * time.Second,
+		DisableCompression:    true,
+		MaxIdleConnsPerHost:   1,
 	}
 	resp, err := (&http.Client{Transport: tr}).Do(req)
 	if err != nil {
@@ -474,15 +552,30 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 		return fmt.Errorf("encoder returned %s", resp.Status)
 	}
 
-	br := bufio.NewReaderSize(resp.Body, 1<<20)
+	wrote := false
+	br := bufio.NewReaderSize(resp.Body, 1<<16)
 
-	// Write straight to stdout, unbuffered.
+	// Coalesce writes without ever holding video back.
 	//
-	// A buffered writer here is a correctness bug, not an optimisation: it holds
-	// video back until the buffer fills, so the DVR receives bursts instead of a
-	// stream and buffers mid-playback. curl's -N exists for exactly this reason.
-	// Reads are still buffered -- that side costs nothing.
+	// A size-triggered buffer (the earlier bufio.Writer) is a correctness bug: it
+	// waits for the buffer to FILL, so the DVR gets bursts instead of a stream.
+	// But one write(2) per 188-byte packet is ~4,650 syscalls/sec per tuner, and
+	// if that cannot keep pace with arrival, packets queue in the read buffer and
+	// latency grows.
+	//
+	// So batch only what has ALREADY arrived and flush as soon as nothing more is
+	// immediately readable. Latency is identical to writing per packet -- nothing
+	// is ever held waiting for more data -- at a fraction of the syscalls.
 	out := os.Stdout
+	batch := make([]byte, 0, 64*tsPacketSize)
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		_, err := out.Write(batch)
+		batch = batch[:0]
+		return err
+	}
 
 	var lastPAT, lastPMT []byte
 	pmtPids := map[uint16]bool{}
@@ -523,10 +616,24 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 		// bytes through instead.
 		if open && !aligned && time.Since(gateAt) > c.alignTimeout+relaxWindow {
 			aligned = true
-			logf(c, "no keyframe at all within %s; streaming unaligned", c.alignTimeout+relaxWindow)
+			logf(c, "no keyframe recognised within %s; streaming unaligned (encoder may not signal random access -- try ALIGN_KEYFRAME=0)", c.alignTimeout+relaxWindow)
+			// Still send the tables, otherwise the DVR has to wait for the
+			// encoder's next PSI cycle on top of everything else.
+			if lastPAT != nil {
+				batch = append(batch, lastPAT...)
+			}
+			if lastPMT != nil {
+				batch = append(batch, lastPMT...)
+			}
 		}
 
 		if err := readPacket(br, pkt); err != nil {
+			flush()
+			// An encoder with no input can answer 200 with an empty body. Treating
+			// that as a clean EOF exited 0 having sent the DVR nothing at all.
+			if !wrote {
+				return fmt.Errorf("encoder sent no video (%v)", err)
+			}
 			return err
 		}
 
@@ -557,9 +664,23 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 		// and quality settings. The stream calibrates itself -- remember the
 		// quietest window seen, and call it motion when a window rises well above
 		// that floor and HOLDS, since the cut itself produces brief spikes.
-		winBytes += tsPacketSize
+		// Exclude null padding. A constant-bitrate encoder pads with PID 0x1FFF to
+		// hold the mux rate steady, so counting every packet measures the mux rate
+		// rather than the picture and motion can never be detected.
+		if p != 0x1fff {
+			winBytes += tsPacketSize
+		}
 		if now := time.Now(); now.Sub(winStart) >= c.motionWindow {
-			rate := float64(winBytes) / now.Sub(winStart).Seconds()
+			elapsed := now.Sub(winStart)
+			// Drop windows that ran long. If the stream stalls -- an HDMI resync on
+			// wake is enough -- the window still closes and measures a near-zero
+			// rate, which latches the floor permanently low and makes every later
+			// window look like motion.
+			if elapsed > 2*c.motionWindow {
+				winBytes, winStart = 0, now
+				continue
+			}
+			rate := float64(winBytes) / elapsed.Seconds()
 			if floorRate < 0 || rate < floorRate {
 				floorRate = rate
 			}
@@ -629,15 +750,22 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 				p, discarded, float64(discarded*tsPacketSize)/1024,
 				time.Since(gateAt).Seconds(), path)
 			if lastPAT != nil {
-				out.Write(lastPAT)
+				batch = append(batch, lastPAT...)
 			}
 			if lastPMT != nil {
-				out.Write(lastPMT)
+				batch = append(batch, lastPMT...)
 			}
 		}
 
-		if _, err := out.Write(pkt); err != nil {
-			return err
+		batch = append(batch, pkt...)
+		wrote = true
+		// Flush as soon as nothing more has already arrived, or the batch is full.
+		// Never waits for data -- latency matches a per-packet write, at a fraction
+		// of the syscalls.
+		if br.Buffered() < tsPacketSize || len(batch)+tsPacketSize > cap(batch) {
+			if err := flush(); err != nil {
+				return err
+			}
 		}
 	}
 }
