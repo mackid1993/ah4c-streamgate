@@ -793,3 +793,51 @@ func TestStreamKeepsInterleavedTablesAndPadding(t *testing.T) {
 	out := runStream(t, testConfig(srv.URL), gate)
 	checkContiguous(t, input, out, firstKeyframeAt(input, 0))
 }
+
+// A PMT can name a video pid the mux never carries -- a stale table, a
+// mislabelled stream_type. Trusting it over observation cost the whole tune:
+// with ALIGN_KEYFRAME=0 the align-timeout escape never runs, so every packet
+// was suppressed and an encoder streaming video continuously produced zero
+// bytes and a log blaming the HDMI input. After one READ_TIMEOUT with nothing
+// on the declared pids, observation wins.
+func TestWrongPIDPMTStillRecords(t *testing.T) {
+	// A PMT on the expected PMT pid declaring H.264 on 0x300 -- a pid that
+	// never appears. The real video is on testVideoPid.
+	wrongPMT := make([]byte, tsPacketSize)
+	wrongPMT[0], wrongPMT[1], wrongPMT[2], wrongPMT[3] = 0x47, 0x40|pmtHi, pmtLo, 0x10
+	wrongPMT[4] = 0x00
+	s := wrongPMT[5:]
+	s[0], s[1], s[2] = 0x02, 0xb0, 0x12
+	s[3], s[4] = 0x00, 0x01
+	s[5], s[6], s[7] = 0xc1, 0x00, 0x00
+	s[8], s[9] = 0xe3, 0x00 // PCR pid 0x300
+	s[10], s[11] = 0xf0, 0x00
+	s[12] = 0x1b              // H.264...
+	s[13], s[14] = 0xe3, 0x00 // ...on pid 0x300, which is never muxed
+	s[15], s[16] = 0xf0, 0x00
+
+	var input []byte
+	input = append(input, patPacket(0)...)
+	input = append(input, wrongPMT...)
+	for i := 0; i < 900; i++ {
+		input = append(input, videoPacket(byte(i&0x0f), i > 0 && i%20 == 0, i+1)...)
+	}
+	srv := serveTS(t, input, 3*time.Millisecond)
+	defer srv.Close()
+
+	c := testConfig(srv.URL)
+	c.alignKey = false // the mode with no align-timeout escape
+	c.readTimeout = 1500 * time.Millisecond
+	gate := make(chan struct{})
+	close(gate)
+
+	out := runStream(t, c, gate)
+	if len(out) == 0 {
+		t.Fatal("zero bytes out of an encoder streaming video continuously -- the PMT was trusted over observation to the end")
+	}
+	// What did come out must still be an unbroken run of the input's tail.
+	idx := bytes.Index(input, out)
+	if idx < 0 || idx%tsPacketSize != 0 || idx+len(out) != len(input) {
+		t.Fatal("post-relaxation output is not a contiguous run of the input")
+	}
+}

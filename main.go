@@ -1411,6 +1411,18 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) (wrote boo
 				// waited on a pipe that would never carry a byte. Failing loudly is
 				// strictly better.
 				if aligned && !noVideoAt.IsZero() && time.Since(noVideoAt) > c.readTimeout {
+					// Before failing, stop trusting the PMT once. With ALIGN_KEYFRAME=0
+					// the align-timeout path never runs, so a PMT naming a video pid
+					// the mux never carries suppressed every packet to the end -- zero
+					// bytes out of an encoder streaming video continuously. Observation
+					// outranks the table: give the basic rule one bound of its own, and
+					// only then declare there is no picture.
+					if len(vidPids) > 0 && !alignGaveUp {
+						alignGaveUp = true
+						noVideoAt = time.Time{}
+						logf(c, "no picture on the PMT-declared video pids for %v; accepting any non-padding packet (the PMT may be stale)", c.readTimeout)
+						continue
+					}
 					return wrote, fmt.Errorf("encoder sent no picture for %v, only padding and tables (is anything connected to its HDMI input?): %w",
 						c.readTimeout, errNoPicture)
 				}
