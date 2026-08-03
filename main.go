@@ -44,18 +44,17 @@ import (
 )
 
 const (
-	// A read that returns faster than this came out of a buffer rather than off
-	// the network. 500us is far above the few microseconds a buffered copy takes
-	// and far below the milliseconds between packets at any realistic bitrate.
-	// DRAIN_IDLE=0 turns catching up off entirely.
-	maxDrain = 20000 // ~3.7MB, a stop so a bursting encoder cannot spin
+	// maxDrain bounds the catch-up discard by packet count (~3.7MB), so an
+	// encoder that genuinely bursts faster than real time cannot spin the drain
+	// forever. The timing threshold itself is DRAIN_IDLE, in loadConfig.
+	maxDrain = 20000
 
 	tsPacketSize = 188
 	// Below this a measurement window is a gap in the stream, not a picture. 8
 	// packets is 48 kbit/s over a full 250ms window, 24 kbit/s over the 2x-length
 	// window the guard still permits -- under any real still frame either way. It
-	// is a floor on absurdity, not the whole defence; the two-lowest rule above
-	// is what actually stops one artifact becoming the floor.
+	// is a floor on absurdity, not the whole defence; the two-lowest rule in the
+	// motion accounting is what actually stops one artifact becoming the floor.
 	minWindowPackets = 8
 	// However DRAIN_IDLE is set, catching up is a handoff cost, not a phase of
 	// the recording. Without this a DRAIN_IDLE larger than the socket read
@@ -66,8 +65,9 @@ const (
 	// Redials permitted after the gate has opened. Unbounded would leave the DVR
 	// waiting on an encoder that is never coming back.
 	maxPostGateDials = 3
-	// After ALIGN_TIMEOUT we stop insisting on motion and take any keyframe;
-	// this is the extra grace before giving up on alignment entirely.
+	// Extra grace past ALIGN_TIMEOUT before giving up on alignment entirely and
+	// streaming unaligned. (MOTION_TIMEOUT, not this, is what stops the motion
+	// insistence -- loadConfig keeps it strictly shorter than ALIGN_TIMEOUT.)
 	relaxWindow = 2 * time.Second
 )
 
@@ -126,13 +126,6 @@ func envRaw(k string) string {
 	return strings.TrimSpace(v)
 }
 
-func env(k, def string) string {
-	if v := envRaw(k); v != "" {
-		return v
-	}
-	return def
-}
-
 // envBool accepts the usual spellings instead of "anything except 0".
 func envBool(k string, def bool) bool {
 	v := envRaw(k)
@@ -188,6 +181,10 @@ func parseDur(k string, def time.Duration, allowZero bool) time.Duration {
 			warnEnv(k, v, why)
 			return def
 		}
+		if d > maxKnobDur {
+			warnEnv(k, v, "longer than 24h makes no sense for a tuner")
+			return def
+		}
 		return d
 	}
 	f, err := strconv.ParseFloat(v, 64)
@@ -200,8 +197,20 @@ func parseDur(k string, def time.Duration, allowZero bool) time.Duration {
 		warnEnv(k, v, why)
 		return def
 	}
+	// The float->Duration conversion saturates around 292 years, and arithmetic
+	// downstream adds constants to these values -- alignTimeout+relaxWindow
+	// wrapped NEGATIVE on an absurd input, which released alignment on the first
+	// packet with a nonsense duration in the log. Nothing a tuner does needs a
+	// day.
+	if d > maxKnobDur {
+		warnEnv(k, v, "longer than 24h makes no sense for a tuner")
+		return def
+	}
 	return d
 }
+
+// maxKnobDur bounds every duration setting. See parseDur.
+const maxKnobDur = 24 * time.Hour
 
 func envFloat(k string, def float64) float64 {
 	v := envRaw(k)
@@ -296,6 +305,19 @@ func loadConfig() (*config, error) {
 	if c.waitMotion && c.motionTimeout >= c.alignTimeout {
 		c.alignTimeout = c.motionTimeout + 2*time.Second
 	}
+	// The motion gate needs roughly 2+MOTION_HOLD measurement windows before it
+	// CAN fire: two to establish a floor, then MOTION_HOLD above it. Set
+	// MOTION_WINDOW large next to MOTION_TIMEOUT -- 1s against the 6s default is
+	// enough -- and it silently never fires, so the card is recorded AND every
+	// tune stalls the full MOTION_TIMEOUT, while the log reads as if the encoder
+	// were CBR. Warn at half margin rather than the theoretical bound, because a
+	// window straddling the card-to-picture cut is wasted in practice.
+	if c.waitMotion &&
+		float64(2+c.motionHold)*c.motionWindow.Seconds()*2 >= c.motionTimeout.Seconds() {
+		fmt.Fprintf(os.Stderr,
+			"streamgate: MOTION_WINDOW=%v is large next to MOTION_TIMEOUT=%v -- the motion gate needs ~%d windows to fire and may never make it, so every tune would pay the full MOTION_TIMEOUT; lower MOTION_WINDOW or raise MOTION_TIMEOUT\n",
+			c.motionWindow, c.motionTimeout, 2+c.motionHold)
+	}
 	if c.encoderURL == "" {
 		return nil, fmt.Errorf("ENCODER%s_URL not set", n)
 	}
@@ -381,8 +403,11 @@ func newCodec(ids []string, base map[string]bool) string {
 // older than Android 11, and vendor builds that report codecs differently.
 // Without a fallback such a device never detects anything and every tune fails.
 //
-// state=3 with speed=1 is playing; state=2 is stopped. Checked in that order
-// because a line can carry both and playing is the stronger claim.
+// state=3 with speed=1 is playing. The "stopped" label below is returned for
+// state=2, which in Android's enum is actually PAUSED (STOPPED is 1) -- harmless,
+// because every caller treats all non-playing labels identically: they arm the
+// fallback. Playing is checked first because a line can carry both markers and
+// playing is the stronger claim.
 func mediaSessionState(dump string) string {
 	for _, line := range strings.Split(dump, "\n") {
 		if !strings.Contains(line, "PlaybackState") {
@@ -580,15 +605,15 @@ func waitForVideo(ctx context.Context, c *config) error {
 		// tears its MediaSession down mid-retune leave `armed` false forever, and
 		// on a box with no usable resource-manager signal that fails every tune.
 		sessionRead := complete && (strings.TrimSpace(ms) == "" || strings.Contains(ms, "PlaybackState"))
-		// Completeness is not legibility. A probe that finished but whose resource
-		// half says "Can't find service: media.resource_manager" -- a binder blip,
-		// a dumpsys timeout, the service restarting -- yields an EMPTY baseline,
-		// and then the outgoing channel's decoder reads as new on the next poll.
-		// Accept a baseline only from a half we could actually read.
-		// Legibility of each half, judged separately. Letting the session half
-		// vouch for the resource half made a binder blip install an empty codec
-		// baseline; requiring the resource half outright made every tune fail on a
-		// box that simply has no resource manager. They are different questions.
+		// Completeness is not legibility, and each half is judged separately. A
+		// probe that finished but whose resource half says "Can't find service:
+		// media.resource_manager" -- a binder blip, a dumpsys timeout, the service
+		// restarting -- parses to an EMPTY decoder list, and installing that as
+		// the codec baseline made the outgoing channel's decoder read as new on
+		// the next poll. Letting the session half vouch for the resource half
+		// reopened exactly that; requiring the resource half outright failed every
+		// tune on a box that simply has no resource manager. Different questions,
+		// separate flags.
 		rmLegible := strings.Contains(rm, "Processes:") || strings.Contains(rm, "Events logs")
 		// After enough legible dumps with no terminator, conclude this build does
 		// not print one rather than never locking a codec baseline at all.
@@ -596,8 +621,6 @@ func waitForVideo(ctx context.Context, c *config) error {
 			noTermPolls++
 			noTerminator = noTermPolls >= 3
 		}
-		// A truncated transport is a fault the reconnect exists for, so it has to
-		// keep counting toward consecFailures rather than resetting it.
 		// A transport that truncates is the fault the reconnect exists for, so it
 		// counts like one -- and it has to count on EVERY poll, not just before the
 		// baseline. Applying it only there meant 83 post-baseline truncated polls
@@ -894,21 +917,19 @@ func (c *idleTimeoutConn) Read(b []byte) (int, error) {
 
 // ------------------------------------------------------------------ streaming
 
-// stream opens the encoder and copies it to stdout. If the gate has not opened
-// yet it discards; once opened it emits PAT/PMT then aligns to the next
-// keyframe, so the DVR's first bytes are immediately decodable.
+// stream opens the encoder and copies it to stdout. While nothing has been
+// emitted it redials on any failure: the connection is live for the whole
+// detection wait -- up to TUNE_TIMEOUT, with READ_TIMEOUT (10s) inside it, and
+// an HDMI resync on the channel change is enough to trip that -- so a transient
+// interruption must not kill the tune. Nothing is lost by redialling while the
+// gate is shut, because every byte is being discarded anyway; once the gate is
+// open the redial is bounded by maxPostGateDials, since by then the DVR is
+// waiting and a dead encoder must fail the tune rather than hold it.
 //
-// It never emits anything received before `gate` fires. Everything it writes,
-// curl would also have written -- it only ever skips forward.
-// stream keeps trying to reach the encoder until the gate opens. Once it has,
-// the connection is the recording and a failure is terminal.
+// Once a byte has been emitted the connection IS the recording and any failure
+// is terminal. Apart from the cached PAT/PMT injected at the head, nothing
+// received before the gate fired is ever emitted -- it only skips forward.
 //
-// The connection is opened at t=0, so it is live for the whole detection wait --
-// up to TUNE_TIMEOUT, 40s by default. Anything that interrupts it in that window
-// used to kill the tune outright with zero bytes, even though playback was then
-// detected and the encoder was healthy again. READ_TIMEOUT is 10s inside that
-// 40s, and an HDMI resync on the channel change is enough to trip it. Nothing is
-// lost by redialling: before the gate every byte is discarded anyway.
 // errNoPicture is terminal, not retryable: the encoder answered and kept
 // answering, there is simply nothing to record. Routing it through the redial
 // path re-paid the entire align window on every attempt -- ~81s of a held tuner
@@ -977,6 +998,10 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) (wrote boo
 		DisableCompression:    true,
 		MaxIdleConnsPerHost:   1,
 	}
+	// Each attempt builds its own Transport, so reap it on the way out. Without
+	// this every pre-gate redial parked one connection in an abandoned pool until
+	// its read deadline fired -- bounded, but pointless to carry.
+	defer tr.CloseIdleConnections()
 	resp, err := (&http.Client{Transport: tr}).Do(req)
 	if err != nil {
 		return false, err
@@ -1360,34 +1385,40 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) (wrote boo
 		// up none of it is queued: otherwise the flush below shovelled thousands of
 		// stuffing bytes at the DVR and only reported "encoder sent no video" at
 		// EOF, long after the bytes had gone.
-		// Only evaluated until the first real packet: after that `wrote` is true
-		// and the map lookup would run on every packet for the whole recording.
-		// When the PMT named the video pids, require one of them -- but only while
-		// we still believe them. alignCandidate has an escape hatch for a PMT that
-		// names a video pid the mux never carries; this filter was written from it
-		// and the escape was left out, so on such a stream ALIGN_TIMEOUT released
-		// alignment and then every single packet was suppressed: zero bytes out of
-		// an encoder streaming video continuously, and a log blaming the HDMI
-		// input. Once alignment has given up on recognising video, so does this.
-		notPicture := p == 0x1fff || p == 0 || pmtPids[p]
-		if len(vidPids) > 0 && !alignGaveUp {
-			notPicture = !vidPids[p]
-		}
-		if !wrote && notPicture {
-			// Bounded. Suppressing padding until a real packet arrives is right, but
-			// nothing here made that wait finite: READ_TIMEOUT is idle-only, so an
-			// encoder muxing with no HDMI input keeps the deadline pushed out with
-			// nulls forever. The process then held a tuner slot indefinitely, with
-			// zero bytes, no log and no exit, while the DVR waited on a pipe that
-			// would never carry a byte. Failing loudly is strictly better.
-			if aligned && !noVideoAt.IsZero() && time.Since(noVideoAt) > c.readTimeout {
-				return wrote, fmt.Errorf("encoder sent no picture for %v, only padding and tables (is anything connected to its HDMI input?): %w",
-					c.readTimeout, errNoPicture)
+		//
+		// The whole block sits under !wrote, so once the first real packet has
+		// gone out nothing here -- including the map lookups -- runs again for the
+		// life of the recording, and everything passes through byte-exact.
+		if !wrote {
+			// When the PMT named the video pids, require one of them -- but only
+			// while we still believe them. alignCandidate has an escape hatch for a
+			// PMT that names a video pid the mux never carries; this filter was
+			// written from it and the escape was left out, so on such a stream
+			// ALIGN_TIMEOUT released alignment and then every single packet was
+			// suppressed: zero bytes out of an encoder streaming video continuously,
+			// and a log blaming the HDMI input. Once alignment has given up on
+			// recognising video, so does this.
+			notPicture := p == 0x1fff || p == 0 || pmtPids[p]
+			if len(vidPids) > 0 && !alignGaveUp {
+				notPicture = !vidPids[p]
 			}
-			if aligned && noVideoAt.IsZero() {
-				noVideoAt = time.Now()
+			if notPicture {
+				// Bounded. Suppressing padding until a real packet arrives is right,
+				// but nothing here made that wait finite: READ_TIMEOUT is idle-only,
+				// so an encoder muxing with no HDMI input keeps the deadline pushed
+				// out with nulls forever. The process then held a tuner slot
+				// indefinitely, with zero bytes, no log and no exit, while the DVR
+				// waited on a pipe that would never carry a byte. Failing loudly is
+				// strictly better.
+				if aligned && !noVideoAt.IsZero() && time.Since(noVideoAt) > c.readTimeout {
+					return wrote, fmt.Errorf("encoder sent no picture for %v, only padding and tables (is anything connected to its HDMI input?): %w",
+						c.readTimeout, errNoPicture)
+				}
+				if aligned && noVideoAt.IsZero() {
+					noVideoAt = time.Now()
+				}
+				continue
 			}
-			continue
 		}
 		batch = append(batch, pkt...)
 		wrote = true

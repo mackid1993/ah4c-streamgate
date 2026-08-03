@@ -28,8 +28,13 @@ func TestEnvDur(t *testing.T) {
 		{"abc", def},
 		{"NaN", def}, // used to overflow to a huge negative duration
 		{"Inf", def},
-		{"0", def},  // zero would busy-loop or fail instantly
-		{"-1", def}, // negative likewise
+		// The float conversion saturates around 292 years, and downstream
+		// arithmetic adds constants -- alignTimeout+relaxWindow wrapped NEGATIVE,
+		// releasing alignment on the first packet. Capped at 24h.
+		{"1e19", def},
+		{"2400h", def}, // ParseDuration accepts it; the cap must too
+		{"0", def},     // zero would busy-loop or fail instantly
+		{"-1", def},    // negative likewise
 	}
 	for _, c := range cases {
 		os.Setenv("T_DUR", c.in)
