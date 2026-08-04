@@ -309,8 +309,15 @@ func loadConfig() (*config, error) {
 	// one side, card on the other -- can read as motion and release onto the
 	// card: measured at 3 of 4 runs with the drain disabled. 2 is structurally
 	// safe (one polluted window cannot be two consecutive).
+	//
+	// Not warnEnv, which says "using the default": this clamps to 2, the
+	// structural floor, and the default is 3. These warning lines exist so the
+	// log can be trusted over guesswork, so they must not misstate what the
+	// program did.
 	if c.waitMotion && c.motionHold < 2 {
-		warnEnv("MOTION_HOLD", strconv.Itoa(c.motionHold), "below 2 a window straddling the gate can read as motion")
+		fmt.Fprintf(os.Stderr,
+			"streamgate: raising MOTION_HOLD=%d to 2 -- below 2 a single window straddling the gate can read as motion\n",
+			c.motionHold)
 		c.motionHold = 2
 	}
 	// The motion gate needs roughly 2+MOTION_HOLD measurement windows before it
