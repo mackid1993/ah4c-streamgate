@@ -2,7 +2,7 @@
 
 A gate for [ah4c](https://github.com/sullrich/ah4c) that waits until your Android box is **actually playing video** before handing the encoder stream to your DVR.
 
-Without it, recording starts the moment the tuner is reserved — so the first several seconds of every tune are a splash screen, a loading spinner, or the channel you were on before. streamgate watches the box over adb, waits for real playback, and only then opens the pipe.
+Without it, recording starts the moment the tuner is reserved — so the first several seconds of every tune are a splash screen, a loading spinner, or the channel you were on before. streamgate watches the box, waits for real playback, and only then opens the pipe.
 
 The video is never re-encoded. The encoder's bytes go through untouched.
 
@@ -22,13 +22,15 @@ Three properties hold on every code path. They are structural, not configuration
 
 ## Install
 
-Download a binary from [Releases](../../releases) — `linux-amd64`, `linux-arm64`, or `linux-armv7`. They're statically linked, so there's nothing to install alongside them. They do call `adb`, which the ah4c image already ships.
+Download a binary from [Releases](../../releases) — `linux-amd64`, `linux-arm64`, or `linux-armv7`. They're statically linked, so there's nothing to install alongside them.
 
 ```sh
 curl -fsSL -o /path/to/ah4c/scripts/streamgate \
   https://github.com/mackid1993/ah4c-streamgatego/releases/latest/download/streamgate-linux-amd64
 chmod +x /path/to/ah4c/scripts/streamgate
 ```
+
+That directory is the one you already bind-mount for ah4c; inside the container it's `/opt/scripts`.
 
 Every release also ships a `SHA256SUMS` manifest, so the download can be verified:
 
@@ -37,51 +39,70 @@ curl -fsSLO https://github.com/mackid1993/ah4c-streamgatego/releases/latest/down
 sha256sum -c SHA256SUMS --ignore-missing
 ```
 
-That directory is the one you already bind-mount for ah4c; inside the container it's `/opt/scripts`. Then point each tuner's `CMD` at it, with the tuner number as the only argument:
-
-```
-CMD1=/opt/scripts/streamgate 1
-CMD2=/opt/scripts/streamgate 2
-```
-
-Restart the container. `TUNERn_IP` and `ENCODERn_URL` are read from the environment — there's nothing else to configure, and the defaults are meant to be good.
-
-Check both spellings. A missing `ENCODERn_URL` exits immediately, but a missing or misspelled `TUNERn_IP` is **not** fatal: that tuner logs `TUNERn_IP not set -- no gate` once and then streams ungated, so it records the head of the previous channel on every tune, indefinitely, with no other complaint.
-
 ---
 
-## How `CMDn` works in ah4c
+## Setting up the tuners
 
-ah4c has two ways to source a tuner's video.
+streamgate is wired in per tuner with three environment variables, set on the ah4c container (it inherits ah4c's environment). For tuner `n`:
 
-**Without `CMDn`** it fetches `ENCODERn_URL` itself and copies those bytes to your DVR.
+| Variable | Required | What it is |
+|---|---|---|
+| `CMDn` | yes | The command whose stdout becomes tuner *n*'s stream: the streamgate path plus the tuner number, nothing else. |
+| `ENCODERn_URL` | yes | The HTTP URL of tuner *n*'s encoder stream. If it's missing, streamgate exits immediately with a configuration error. |
+| `TUNERn_IP` | yes, in practice | The Android box's network address, **including the port** (`:5555`). A missing or misspelled `TUNERn_IP` is *not* fatal: that tuner logs `TUNERn_IP not set -- no gate` once and then streams ungated — so it records the head of the previous channel on every tune, indefinitely, with no other complaint. Check the spelling. |
 
-**With `CMDn`** it runs your command instead and pipes **that command's stdout** to the DVR. Whatever the command writes *is* the stream. If it exits without writing anything, the tune fails.
+How the hook works: ah4c pipes `CMDn`'s stdout to your DVR — whatever the command writes *is* the stream, and a command that exits without writing fails the tune. streamgate withholds stdout while it watches the box, then streams the encoder once playback is real. Two things follow from how ah4c runs the command: it is **exec'd directly, not run through a shell** (no `$VAR` expansion, no pipes — a binary plus a number is the clean form), and it **starts before your tune script fires**, which is deliberate: streamgate snapshots what the *previous* channel was doing so it can tell that apart from the new one.
 
-That's the hook: streamgate withholds stdout while it watches the box, then streams the encoder once playback is real.
+### In an env file
 
-Two details worth knowing:
+```ini
+CMD1=/opt/scripts/streamgate 1
+TUNER1_IP=192.168.1.31:5555
+ENCODER1_URL=http://192.168.1.41/live/stream0
 
-- **ah4c does not run `CMDn` through a shell.** It splits on spaces and execs directly — no `$VAR` expansion, no pipes. A binary plus a number is the clean form.
-- **`CMDn` runs concurrently with your tune script.** ah4c starts the command, then fires `bmitune.sh` when the DVR first reads. streamgate is already watching before the tune lands, which is deliberate — it snapshots what the *previous* channel was doing so it can tell that apart from the new one.
+CMD2=/opt/scripts/streamgate 2
+TUNER2_IP=192.168.1.32:5555
+ENCODER2_URL=http://192.168.1.42/live/stream0
+```
+
+Quoted or unquoted both work. Docker's `--env-file` passes quotes and stray whitespace through literally rather than stripping them, so `TUNER1_IP="192.168.1.31:5555"` reaches the program quotes-and-all — streamgate strips them itself, along with any optional setting written the same way.
+
+### In docker-compose
+
+Either point `env_file:` at the file above, or put the same variables under `environment:` on your existing ah4c service:
+
+```yaml
+services:
+  ah4c:
+    # ...your existing ah4c service...
+    environment:
+      - CMD1=/opt/scripts/streamgate 1
+      - TUNER1_IP=192.168.1.31:5555
+      - ENCODER1_URL=http://192.168.1.41/live/stream0
+      - CMD2=/opt/scripts/streamgate 2
+      - TUNER2_IP=192.168.1.32:5555
+      - ENCODER2_URL=http://192.168.1.42/live/stream0
+```
+
+Restart the container after either change. That's the whole setup — every other variable below is optional, and the defaults are meant to be good.
 
 ---
 
 ## How it decides playback is real
 
-Two signals, cheapest first, both from a single adb round trip per poll.
+Two signals, cheapest first, both from a single probe of the box per poll.
 
-**1. A new secure video decoder.** `dumpsys media.resource_manager` lists which processes hold a video codec. Android issues a new client id per playback session, so streamgate records the **set** of ids before tuning and waits for one that wasn't in it.
+**1. A new secure video decoder.** The box's resource manager lists which processes hold a video codec. Android issues a new client id per playback session, so streamgate records the **set** of ids before tuning and waits for one that wasn't in it.
 
 That distinction matters more than it looks. Asking whether a decoder merely *exists* returns true immediately, because the previous channel's decoder is often still allocated when the gate starts — an in-place channel switch tears nothing down. Comparing sets rather than picking one id also means it doesn't matter what order the device lists them in, which varies.
 
-**2. The media session.** `dumpsys media_session` reporting `state=3` with `speed=1`. Used when the first signal isn't available — older Android, or vendor builds that report codecs differently.
+**2. The media session.** The box reporting a session in the playing state at normal speed. Used when the first signal isn't available — older Android, or vendor builds that report codecs differently.
 
-This one has no identity, so it only counts once it has dropped at least once since the gate started. A channel that just ended can leave its session parked at exactly `state=3`, and without that rule it would read as instant success.
+This one has no identity, so it only counts once it has dropped at least once since the gate started. A channel that just ended can leave its session parked at exactly "playing", and without that rule it would read as instant success.
 
 Whichever fires must hold for `CONFIRM` consecutive polls.
 
-Both rest on the baseline being real, so the timing baseline is taken by the first poll that actually comes back, and the codec baseline by the first one whose resource dump arrived whole — not by one unchecked call at startup. An empty dump makes every decoder look new and reads as "not playing", so a single failed probe (and the call right after `adb connect` is the likeliest one to fail) would otherwise open the gate immediately on the channel you're leaving. A dump is only believed whole once it reaches its terminator, because "there was nothing to list" and "the list was cut off" are identical to a substring test. If the adb session drops mid-wait, streamgate reconnects rather than spending the rest of `TUNE_TIMEOUT` failing.
+Both rest on the baseline being real, so the timing baseline is taken by the first poll that actually comes back, and the codec baseline by the first one whose dump arrived whole — not by one unchecked call at startup. An empty dump makes every decoder look new and reads as "not playing", so a single failed probe would otherwise open the gate immediately on the channel you're leaving. A dump is only believed whole once it reaches its terminator, because "there was nothing to list" and "the list was cut off" are identical to a substring test. If the connection to the box drops mid-wait, streamgate reconnects rather than spending the rest of `TUNE_TIMEOUT` failing.
 
 ---
 
@@ -148,9 +169,9 @@ optimisation:
 
 Motion seen *before* the gate — the wake animation, the home screen, the app launching, the channel you're leaving — is never evidence about the new channel, so the latch is always dropped when the gate opens and motion must prove itself again on the new picture. The learned floor is kept, so a warm tune re-latches within `MOTION_HOLD` windows (~750ms at defaults, usually inside the keyframe wait it already pays) while the card, sitting at the floor, cannot. `REARM_MOTION=1` additionally forgets the floor itself — for apps whose pre-gate picture is so quiet that a kept floor would let the card read as a rise. Off by default; the same trade-off note below applies.
 
-## Settings
+## Optional settings
 
-All optional, all environment variables, set on the **ah4c container** (streamgate inherits its environment). Durations accept either seconds (`5`, `0.25`) or Go syntax (`10s`, `250ms`). A value that can't be parsed is ignored with a warning on stderr rather than silently falling back.
+Everything here is optional, set the same way as the tuner variables — in the env file or under `environment:` in compose. Durations accept either seconds (`5`, `0.25`) or Go syntax (`10s`, `250ms`). A value that can't be parsed is ignored with a warning on stderr rather than silently falling back.
 
 Note these apply to **every tuner**. If you need one tuner to differ — say a different app with a longer intro — set it on that tuner's command instead:
 
@@ -191,7 +212,7 @@ If yours doesn't, you have two options, in order:
 
 **Raise `SETTLE`.** The decoder is allocated a little before the app puts real video on screen. `SETTLE` is a flat pause covering that gap; `0.5` or `0.75` is a reasonable next step. Cheap, but it's a timer — it doesn't know what's on screen, so it can be too short on a slow tune and wasted time on a fast one.
 
-**Or set `WAIT_AUDIO=1`.** This waits for the app to start audio playback for the **new** tune before opening the gate — a *new* audio track id reaching the started state, compared against the tracks already playing at tune start, so the previous channel's still-running audio can't satisfy it. On these boxes it is the true render clock: video is tunneled and slaved to the audio hardware-sync output, so the first pixel cannot appear before that track runs (SurfaceFlinger is blind to tunneled video — measured, its frame timestamps stay zero throughout playback). It costs the real time the box takes to begin playback — roughly 0.7s — and is bounded by `RENDER_TIMEOUT` so a device that never reports audio still tunes.
+**Or set `WAIT_AUDIO=1`.** This waits for the app to start audio playback for the **new** tune before opening the gate — a *new* audio track id reaching the started state, compared against the tracks already playing at tune start, so the previous channel's still-running audio can't satisfy it. On these boxes it is the true render clock: video is tunneled and slaved to the audio hardware-sync output, so the first pixel cannot appear before that track runs. It costs the real time the box takes to begin playback — roughly 0.7s — and is bounded by `RENDER_TIMEOUT` so a device that never reports audio still tunes.
 
 The comparison baseline is the first **whole** audio dump after detection, proven by an echoed marker the same way the detection probe proves its own dumps finished. A dump that arrives cut off cannot install a baseline that is silently missing the previous channel's track — that track would later read as *new* audio and open the gate on the card, which is the artifact this setting exists to prevent. A cut-off dump is retried a poll later; a transport that never delivers a whole dump falls back to accepting any started media track, which is never worse than not having the identity check at all.
 
@@ -274,22 +295,15 @@ streamgate[1]: t=1.2s codec=abc123 base=abc123 session=stopped armed=true hits=0
 
 **Which build am I running?** `streamgate --version`. Release binaries are stamped with their tag; a build from source reports `dev`.
 
-**Every tune times out.** First check that adb works from inside the container — `docker exec <container> adb devices` should list your tuner as `device`, not `offline` or `unauthorized`. Then check the box exposes at least one signal:
-
-```sh
-adb -s <ip>:5555 shell dumpsys media.resource_manager
-adb -s <ip>:5555 shell "dumpsys media_session | grep -m1 PlaybackState"
-```
-
-The timeout message itself tells you which of five different things actually happened — it is written to be pasted into a support thread, so paste the whole line:
+**Every tune times out.** The timeout message tells you which of five different things actually happened — it is written to be pasted into a support thread, so paste the whole line:
 
 | the message says | what happened | what to do |
 |---|---|---|
-| `the whole budget went to connecting` | `adb connect` ate the entire `TUNE_TIMEOUT`; the box was never polled once. | Check the box is reachable and awake; raise `TUNE_TIMEOUT` if it is genuinely slow to accept connections. |
-| `every adb call to … failed or returned nothing` | adb never answered. | Check `TUNERn_IP` includes `:5555`, and that the box authorises this container's adb key. |
-| `never returned a dump this could read` | adb answered, but every dump arrived cut off or unreadable. | Run the manual `dumpsys` above and look at what comes back; a vendor build with a different format looks like this. |
+| `the whole budget went to connecting` | Connecting to the box ate the entire `TUNE_TIMEOUT`; it was never polled once. | Check `TUNERn_IP`, and that the box is reachable and awake; raise `TUNE_TIMEOUT` if it is genuinely slow to accept connections. |
+| `every adb call to … failed or returned nothing` | The box never answered a probe. | Check `TUNERn_IP` includes `:5555`, and that the box authorises the ah4c container (see ah4c's own setup docs). |
+| `never returned a dump this could read` | The box answered, but every dump arrived cut off or in a format streamgate doesn't recognise. | Likely a vendor build with a different reporting format — open an issue with the output of the command the message suggests. |
 | `playback WAS seen but never held` | Detection fired but could not satisfy `CONFIRM` consecutive sightings past `MIN_WAIT` before time ran out. | Lower `CONFIRM` or `MIN_WAIT`, or raise `TUNE_TIMEOUT`. |
-| `nothing changed: baseline codec=… session=…` | adb worked the whole time and the box simply never started playing anything new. | The problem is upstream of streamgate — the tune script, the app, or the channel. `DEBUG=1` shows both signals per poll. |
+| `nothing changed: baseline codec=… session=…` | The box answered the whole time and simply never started playing anything new. | The problem is upstream of streamgate — the tune script, the app, or the channel. `DEBUG=1` shows both signals per poll. |
 
 **Recordings start with the tail of the previous channel.** The gate isn't running. Look for `TUNERn_IP not set -- no gate` at tuner start — a missing or misspelled `TUNERn_IP` disables detection without failing anything.
 
@@ -318,7 +332,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
 
 (`GOARCH=arm64`, or `GOARCH=arm GOARM=7`, for the other release targets. The `-X main.version` stamp is what `--version` reports.)
 
-The test suite needs macOS or Linux: it fakes `adb` with a POSIX shell script installed on `PATH`, so on Windows the adb-harness half fails by construction while the parser and streaming tests still pass. CI runs the whole suite with the race detector on both the declared minimum Go version and the current one:
+The test suite needs macOS or Linux: it fakes the box's debug bridge with a POSIX shell script, so on Windows that half of the suite fails by construction while the parser and streaming tests still pass. CI runs the whole suite with the race detector on both the declared minimum Go version and the current one:
 
 ```sh
 go test -race -count=1 ./...
