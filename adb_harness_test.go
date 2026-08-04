@@ -79,7 +79,11 @@ cmd="$4"
 case "$cmd" in
 *"dumpsys audio"*)
 	echo audio >> "$D/calls"
-	f="$D/audio"
+	an=$(cat "$D/an" 2>/dev/null || echo 0)
+	an=$((an + 1))
+	printf '%s\n' "$an" > "$D/an"
+	f="$D/audio.$an"
+	if [ ! -f "$f" ]; then f="$D/audio"; fi
 	;;
 *)
 	echo shell >> "$D/calls"
@@ -200,6 +204,19 @@ func hWrite(t *testing.T, path, body string) {
 
 // setAudio installs the answer to `dumpsys audio`.
 func (a *hADB) setAudio(body string) { hWrite(a.t, filepath.Join(a.dir, "audio"), body) }
+
+// setAudioStep installs the answer to the Nth `dumpsys audio` call only; calls
+// with no numbered answer fall back to the setAudio body. This is what lets a
+// test hand waitForRender a truncated baseline dump and a whole one on the
+// retry -- the two shapes the baseline's __AUD__ check exists to tell apart.
+func (a *hADB) setAudioStep(n int, body string) {
+	hWrite(a.t, filepath.Join(a.dir, fmt.Sprintf("audio.%d", n)), body)
+}
+
+// hAudioWhole marks an audio dump as having arrived whole, the way the real
+// probe does: the marker is echoed after dumpsys, so its presence proves the
+// dump was not cut off. Fixtures without it read as truncated.
+func hAudioWhole(body string) string { return body + "__AUD__\n" }
 
 func (a *hADB) hangConnect() { hWrite(a.t, filepath.Join(a.dir, "connect.hang"), "") }
 
@@ -962,12 +979,12 @@ func TestWaitForRender(t *testing.T) {
 		// The track must start AFTER the detection-time baseline -- a track
 		// already running at detection is, correctly, not render evidence.
 		a := hNewADB(t, hStep{ids: []string{"A"}})
-		a.setAudio("AudioPlaybackConfiguration piid:9 state:idle usage=USAGE_MEDIA\n")
+		a.setAudio(hAudioWhole("AudioPlaybackConfiguration piid:9 state:idle usage=USAGE_MEDIA\n"))
 		c := hConfig()
 		c.waitAudio = true
 		go func() {
 			time.Sleep(100 * time.Millisecond)
-			a.setAudio("AudioPlaybackConfiguration piid:9 state:started usage=USAGE_MEDIA\n")
+			a.setAudio(hAudioWhole("AudioPlaybackConfiguration piid:9 state:started usage=USAGE_MEDIA\n"))
 		}()
 		var log string
 		start := time.Now()
@@ -982,7 +999,7 @@ func TestWaitForRender(t *testing.T) {
 
 	t.Run("never confirmed", func(t *testing.T) {
 		a := hNewADB(t, hStep{ids: []string{"A"}})
-		a.setAudio("nothing here\n")
+		a.setAudio(hAudioWhole("nothing here\n"))
 		c := hConfig()
 		c.waitAudio = true
 		start := time.Now()
@@ -1626,7 +1643,8 @@ func TestAudioRenderGateRequiresANewPiid(t *testing.T) {
 func TestRenderBaselineIsTakenAtDetectionTime(t *testing.T) {
 	oldOnly := `  AudioPlaybackConfiguration piid:111 type:android.media.AudioTrack u/pid:1/1 state:started attr:AudioAttributes: usage=USAGE_MEDIA content=CONTENT_TYPE_MOVIE`
 	a := hNewADB(t, hStep{ids: []string{"A"}})
-	a.setAudio(oldOnly) // the lingering old-channel track, running at detection
+	// The lingering old-channel track, running at detection, in a whole dump.
+	a.setAudio(hAudioWhole(oldOnly + "\n"))
 	c := hConfig()
 	c.waitAudio = true
 	c.renderTimeout = 400 * time.Millisecond
@@ -1639,6 +1657,59 @@ func TestRenderBaselineIsTakenAtDetectionTime(t *testing.T) {
 	}
 	if took < 350*time.Millisecond {
 		t.Errorf("returned in %v; want the full RENDER_TIMEOUT spent refusing the old track", took)
+	}
+}
+
+// A truncated baseline dump is not a baseline. adbShell keeps partial output
+// on a non-zero exit, so a dump cut off before the old channel's started track
+// parsed to an EMPTY baseline -- and on a wake-resume box that track then read
+// as NEW audio on the next whole dump and confirmed render while the card was
+// still on screen: the one artifact WAIT_AUDIO exists to prevent, logged as a
+// fast confirm. The baseline is now believed only when its dump reached the
+// echoed __AUD__ terminator; a cut-off dump is retried, so the transient
+// truncation costs one CONFIRM_POLL, not the head of the recording.
+func TestTruncatedRenderBaselineDoesNotMakeTheOldTrackLookNew(t *testing.T) {
+	oldOnly := `  AudioPlaybackConfiguration piid:111 type:android.media.AudioTrack u/pid:1/1 state:started attr:AudioAttributes: usage=USAGE_MEDIA content=CONTENT_TYPE_MOVIE`
+	a := hNewADB(t, hStep{ids: []string{"A"}})
+	// The dangerous shape: the cut lands BEFORE the old track's line, so the
+	// truncated dump parses cleanly to zero started tracks.
+	a.setAudioStep(1, "  playback configurations:\n")
+	a.setAudio(hAudioWhole(oldOnly + "\n")) // every later dump arrives whole
+	c := hConfig()
+	c.waitAudio = true
+	c.renderTimeout = 400 * time.Millisecond
+
+	start := time.Now()
+	log := hCaptureStderr(t, func() { waitForRender(context.Background(), c) })
+	took := time.Since(start)
+	if strings.Contains(log, "render confirmed") {
+		t.Fatalf("a truncated baseline let the old channel's track confirm render:\n%s", log)
+	}
+	if took < 350*time.Millisecond {
+		t.Errorf("returned in %v; want the full RENDER_TIMEOUT spent refusing the old track", took)
+	}
+}
+
+// When the transport never once delivers a whole audio dump, the baseline is
+// abandoned after three attempts and the gate degrades to the identity-blind
+// fallback -- the no-baseline behaviour that was chosen deliberately: never
+// worse than the pre-identity gate, and never a render wait that structurally
+// cannot confirm.
+func TestPersistentlyTruncatedRenderBaselineFallsBackIdentityBlind(t *testing.T) {
+	started := `  AudioPlaybackConfiguration piid:9 type:android.media.AudioTrack u/pid:1/1 state:started attr:AudioAttributes: usage=USAGE_MEDIA content=CONTENT_TYPE_MOVIE`
+	a := hNewADB(t, hStep{ids: []string{"A"}})
+	a.setAudio(started + "\n") // no terminator, ever
+	c := hConfig()
+	c.waitAudio = true
+
+	start := time.Now()
+	log := hCaptureStderr(t, func() { waitForRender(context.Background(), c) })
+	took := time.Since(start)
+	if !strings.Contains(log, "render confirmed") {
+		t.Fatalf("identity-blind fallback did not confirm on a started media track:\n%s", log)
+	}
+	if took >= c.renderTimeout {
+		t.Errorf("fallback took %v, want well under RENDER_TIMEOUT %v", took, c.renderTimeout)
 	}
 }
 

@@ -854,14 +854,26 @@ func audioStarted(ctx context.Context, c *config, base map[string]bool, budget t
 // waitForRender blocks until audio playback for the NEW tune has actually
 // started, bounding the wait so a device that never reports it still tunes.
 //
-// The identity baseline is the FIRST dump, taken here at detection time -- not
-// earlier. Any track started at this instant is by definition not evidence of
-// the new tune rendering: the new HW_AV_SYNC track is still created-but-stopped
-// at decoder allocation (verified live), while a box that resumes the previous
-// channel on wake has the OLD channel's track running -- and that track starts
-// AFTER the tune's first polls, so a baseline taken back then would miss it and
-// the old channel's sound would read as render. Snapshotting at detection
-// excludes everything already playing, whoever it belongs to.
+// The identity baseline is the FIRST WHOLE dump, taken here at detection time
+// -- not earlier. Any track started at this instant is by definition not
+// evidence of the new tune rendering: the new HW_AV_SYNC track is still
+// created-but-stopped at decoder allocation (verified live), while a box that
+// resumes the previous channel on wake has the OLD channel's track running --
+// and that track starts AFTER the tune's first polls, so a baseline taken back
+// then would miss it and the old channel's sound would read as render.
+// Snapshotting at detection excludes everything already playing, whoever it
+// belongs to.
+//
+// Whole, proven by the echoed marker, exactly like the detection probe's
+// __MS__ pair: adbShell keeps partial output when adb dies mid-dump, and a
+// baseline cut off before the old channel's started track is a baseline that
+// lies -- on the next whole dump that track reads as NEW audio and confirms
+// render while the card is still on screen, which is the one artifact this
+// gate exists to prevent, logged as a fast confirm. A cut-off dump is retried
+// a poll later, so a transient truncation costs one CONFIRM_POLL; a transport
+// that never once delivers a whole dump degrades after three attempts to the
+// identity-blind fallback in audioStarted -- the deliberate no-baseline
+// behaviour, never worse than the pre-identity gate.
 func waitForRender(ctx context.Context, c *config) {
 	if !c.waitAudio {
 		return
@@ -869,11 +881,20 @@ func waitForRender(ctx context.Context, c *config) {
 	start := time.Now()
 	deadline := start.Add(c.renderTimeout)
 	var base map[string]bool
-	if dump := adbShell(ctx, c.tunerIP, "dumpsys audio", time.Until(deadline)); dump != "" {
-		base = audioPiids(dump)
-		if c.debug {
-			logf(c, "render baseline: %d started media track(s)", len(base))
+	for tries := 1; ; tries++ {
+		dump := adbShell(ctx, c.tunerIP, "dumpsys audio; echo __AUD__", time.Until(deadline))
+		if strings.Contains(dump, "__AUD__") {
+			base = audioPiids(dump)
+			if c.debug {
+				logf(c, "render baseline: %d started media track(s) (attempt %d)", len(base), tries)
+			}
+			break
 		}
+		if tries >= 3 {
+			logf(c, "no whole audio dump in %d attempts; render falls back to any started media track", tries)
+			break
+		}
+		time.Sleep(c.confirmPoll)
 	}
 	for time.Since(start) < c.renderTimeout {
 		if audioStarted(ctx, c, base, time.Until(deadline)) {
