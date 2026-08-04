@@ -317,29 +317,6 @@ streamgate[1]: t=1.2s codec=abc123 base=abc123 session=stopped armed=true hits=0
 
 ---
 
-## Building from source
-
-```sh
-go build -o streamgate .
-```
-
-No dependencies beyond the Go standard library; Go 1.21 or later. To cross-compile a static binary for the ah4c container, mirror what CI does:
-
-```sh
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
-  -ldflags "-s -w -X main.version=$(git describe --tags --always)" -o streamgate .
-```
-
-(`GOARCH=arm64`, or `GOARCH=arm GOARM=7`, for the other release targets. The `-X main.version` stamp is what `--version` reports.)
-
-The test suite needs macOS or Linux: it fakes the box's debug bridge with a POSIX shell script, so on Windows that half of the suite fails by construction while the parser and streaming tests still pass. CI runs the whole suite with the race detector on both the declared minimum Go version and the current one:
-
-```sh
-go test -race -count=1 ./...
-```
-
----
-
 ## Thank you
 
 Thank you to [@sullrich](https://github.com/sullrich), [@bnhf](https://github.com/bnhf), and [@turtletank99](https://github.com/turtletank99) for the original `wait_for_video_playback_detection` idea in the excellent [ADBTuner](https://hub.docker.com/r/turtletank99/adbtuner).
