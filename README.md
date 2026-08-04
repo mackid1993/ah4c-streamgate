@@ -6,7 +6,17 @@ Without it, recording starts the moment the tuner is reserved — so the first s
 
 The video is never re-encoded. The encoder's bytes go through untouched.
 
-> The original POSIX shell implementation lives on the [`bash`](../../tree/bash) branch and still works. This branch is a single static binary that does the same job plus two things a shell script structurally cannot: hold the encoder connection open during the wait, and start the output on a keyframe.
+> The original POSIX shell implementation lives on the [`bash`](../../tree/bash) branch and still works. This branch is a single static binary that does the same job plus three things a shell script structurally cannot: hold the encoder connection open during the wait, start the output on a keyframe, and guarantee that no picture received before the gate opened is ever emitted.
+
+---
+
+## What it will never do
+
+Three properties hold on every code path. They are structural, not configuration:
+
+- **stdout carries nothing but stream bytes.** Every log line goes to stderr. There is no mode, flag or failure in which diagnostics can leak into the recording.
+- **It never emits picture from before the gate opened.** It only ever discards forward. The one exception is the cached PAT/PMT injected at the head — program tables, not video — so it is structurally incapable of introducing a channel-change banner, a tuning prompt or a transition frame that a plain byte-copy would not also have delivered.
+- **It never re-encodes, remuxes or edits.** Once the first byte is out, everything passes through byte-exact.
 
 ---
 
@@ -18,6 +28,13 @@ Download a binary from [Releases](../../releases) — `linux-amd64`, `linux-arm6
 curl -fsSL -o /path/to/ah4c/scripts/streamgate \
   https://github.com/mackid1993/ah4c-streamgatego/releases/latest/download/streamgate-linux-amd64
 chmod +x /path/to/ah4c/scripts/streamgate
+```
+
+Every release also ships a `SHA256SUMS` manifest, so the download can be verified:
+
+```sh
+curl -fsSLO https://github.com/mackid1993/ah4c-streamgatego/releases/latest/download/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
 ```
 
 That directory is the one you already bind-mount for ah4c; inside the container it's `/opt/scripts`. Then point each tuner's `CMD` at it, with the tuner number as the only argument:
@@ -64,7 +81,7 @@ This one has no identity, so it only counts once it has dropped at least once si
 
 Whichever fires must hold for `CONFIRM` consecutive polls.
 
-Both rest on the baseline being real, so the timing baseline is taken by the first poll that actually comes back, and the codec baseline by the first one whose resource dump arrived whole — not by one unchecked call at startup. An empty dump makes every decoder look new and reads as "not playing", so a single failed probe (and the call right after `adb connect` is the likeliest one to fail) would otherwise open the gate immediately on the channel you're leaving. If the adb session drops mid-wait, streamgate reconnects rather than spending the rest of `TUNE_TIMEOUT` failing.
+Both rest on the baseline being real, so the timing baseline is taken by the first poll that actually comes back, and the codec baseline by the first one whose resource dump arrived whole — not by one unchecked call at startup. An empty dump makes every decoder look new and reads as "not playing", so a single failed probe (and the call right after `adb connect` is the likeliest one to fail) would otherwise open the gate immediately on the channel you're leaving. A dump is only believed whole once it reaches its terminator, because "there was nothing to list" and "the list was cut off" are identical to a substring test. If the adb session drops mid-wait, streamgate reconnects rather than spending the rest of `TUNE_TIMEOUT` failing.
 
 ---
 
@@ -151,9 +168,9 @@ The defaults are tuned; most people should never touch these.
 | `SETTLE` | `0.25` | Pause after detecting, before opening the gate. `0` skips it. See "if a recording starts on the app's tuning screen" below. |
 | `MIN_WAIT` | `1` | Ignore "playing" for this many seconds after start. `0` accepts a sighting on the first poll. |
 | `TUNE_TIMEOUT` | `40` | Give up after this long. Costs nothing on a tune that works — the wait ends the moment playback is detected. |
-| `ON_TIMEOUT` | `fail` | `fail` exits without streaming, so your DVR sees a dead tune and can retry or pick another tuner. `stream` sends whatever is on screen instead. An unrecognised value warns and keeps `fail` — a typo here used to disable the fail-safe silently. |
+| `ON_TIMEOUT` | `fail` | `fail` exits without streaming, so your DVR sees a dead tune and can retry or pick another tuner. `stream` sends whatever is on screen instead; `continue` is accepted as an alias of `stream`. An unrecognised value warns and keeps `fail` — a typo here used to disable the fail-safe silently. |
 | `ALIGN_KEYFRAME` | `1` | Start output on a keyframe. `0` streams from wherever the encoder happens to be — and because the motion gate runs while waiting to align, `0` turns `WAIT_MOTION` off too. |
-| `ALIGN_TIMEOUT` | `8` | If no keyframe is recognised within this long, stream unaligned rather than stall. Automatically raised above `MOTION_TIMEOUT` if you set them so they'd conflict. |
+| `ALIGN_TIMEOUT` | `8` | If no keyframe is recognised within this long (plus 2s of grace), stream unaligned rather than stall. Automatically raised above `MOTION_TIMEOUT` if you set them so they'd conflict. |
 | `WAIT_AUDIO` | `0` | After the decoder appears, also wait for audio playback to start. Costs ~0.7s. Only needed if a flash survives `SETTLE`. |
 | `RENDER_TIMEOUT` | `3` | Cap on that wait, so a device that never reports audio still tunes. |
 | `WAIT_MOTION` | `1` | Wait for the picture to start moving before releasing. `0` releases on the first keyframe. |
@@ -175,6 +192,8 @@ If yours doesn't, you have two options, in order:
 **Raise `SETTLE`.** The decoder is allocated a little before the app puts real video on screen. `SETTLE` is a flat pause covering that gap; `0.5` or `0.75` is a reasonable next step. Cheap, but it's a timer — it doesn't know what's on screen, so it can be too short on a slow tune and wasted time on a fast one.
 
 **Or set `WAIT_AUDIO=1`.** This waits for the app to start audio playback for the **new** tune before opening the gate — a *new* audio track id reaching the started state, compared against the tracks already playing at tune start, so the previous channel's still-running audio can't satisfy it. On these boxes it is the true render clock: video is tunneled and slaved to the audio hardware-sync output, so the first pixel cannot appear before that track runs (SurfaceFlinger is blind to tunneled video — measured, its frame timestamps stay zero throughout playback). It costs the real time the box takes to begin playback — roughly 0.7s — and is bounded by `RENDER_TIMEOUT` so a device that never reports audio still tunes.
+
+The comparison baseline is the first **whole** audio dump after detection, proven by an echoed marker the same way the detection probe proves its own dumps finished. A dump that arrives cut off cannot install a baseline that is silently missing the previous channel's track — that track would later read as *new* audio and open the gate on the card, which is the artifact this setting exists to prevent. A cut-off dump is retried a poll later; a transport that never delivers a whole dump falls back to accepting any started media track, which is never worse than not having the identity check at all.
 
 ---
 
@@ -215,7 +234,39 @@ streamgate[1]: no keyframe recognised within 10s; streaming unaligned (encoder m
 streamgate[1]: no playback after 40s (adb ok on 158/160 polls) -- nothing changed: baseline codec=none session=stopped, last poll codec=none session=stopped
 ```
 
-`DEBUG=1` adds a line per poll showing both detection signals and the arming state.
+### Other lines you may see
+
+| line | what it means |
+|---|---|
+| `encoder unavailable, nothing emitted yet (attempt N: …); redialling` | The encoder connection failed before a single byte went out, so retrying is free — nothing is lost while the gate is shut. Once the gate is open, redials are bounded (3 attempts, capped by `READ_TIMEOUT`) so a dead encoder fails the tune instead of holding the DVR. |
+| `no 188-byte sync grid in this stream; accepting bare sync bytes` | The response body doesn't look like MPEG-TS. streamgate relaxes rather than emit nothing, but check what the encoder URL actually returns — an HTML error page is a common culprit. |
+| `no picture on the PMT-declared video pids for Ns; accepting any non-padding packet` | The stream's own PMT names a video PID the mux never carries. Observation outranks the table: streamgate stops trusting the PMT once, then fails only if there is still no picture. |
+| `encoder sent no picture for Ns, only padding and tables` | The encoder is muxing with nothing on its input — null padding and SI tables, no video. Exits 1 rather than shipping a dead mux to the DVR for the length of a programme. Check the HDMI input. |
+| `encoder sent no video (…)` | The encoder answered and then ended or died before a single video byte. Exits 1; nothing was written. |
+| `encoder ended the stream after X and Y MB` | The encoder closed mid-recording. However politely it closed, that truncates the recording, so it is logged and exits 1. |
+| `stream closed by the DVR` | The normal end of every recording — the DVR hung up. Exits 0. |
+| `render confirmed after a further Nms` / `render not confirmed within Ns` | The `WAIT_AUDIO` gate: the new tune's audio track started, or the cap expired and the gate opened anyway. |
+| `no whole audio dump in 3 attempts; render falls back to any started media track` | The `WAIT_AUDIO` baseline could not be verified whole; the gate degrades to the identity-blind check rather than waiting on a baseline it cannot trust. |
+| `raising MOTION_HOLD=N to 2 …` | A configured value below the structural floor was clamped, not defaulted. |
+| `ignoring X="…" -- …; using the default` | A setting failed to parse. The line says exactly which value and why. |
+
+`DEBUG=1` adds a line per poll showing both detection signals and the arming state:
+
+```
+streamgate[1]: t=1.2s codec=abc123 base=abc123 session=stopped armed=true hits=0 playing=false
+```
+
+`codec`/`base` are the current and baseline decoder id sets — detection fires when an id appears that the baseline lacks. `session` is the media-session fallback's reading, `armed` is whether that fallback has earned trust by dropping at least once, and `hits` counts consecutive confirmations toward `CONFIRM`.
+
+---
+
+## Exit status
+
+| code | meaning |
+|---|---|
+| `0` | The recording ended the way recordings end: the DVR closed the pipe. Also `--version`. |
+| `1` | The tune failed, and the last log line says why — detection timed out with `ON_TIMEOUT=fail`, the encoder died or carried no picture, or the stream ended mid-recording. ah4c surfaces this as a failed tune, which your DVR can retry. |
+| `2` | Configuration: no tuner-number argument, or `ENCODERn_URL` unset. Nothing was attempted. |
 
 ---
 
@@ -223,18 +274,55 @@ streamgate[1]: no playback after 40s (adb ok on 158/160 polls) -- nothing change
 
 **Which build am I running?** `streamgate --version`. Release binaries are stamped with their tag; a build from source reports `dev`.
 
-**Every tune times out.** Check that adb works from inside the container — `docker exec <container> adb devices` should list your tuner as `device`, not `offline` or `unauthorized`. Then check the box exposes at least one signal:
+**Every tune times out.** First check that adb works from inside the container — `docker exec <container> adb devices` should list your tuner as `device`, not `offline` or `unauthorized`. Then check the box exposes at least one signal:
 
 ```sh
 adb -s <ip>:5555 shell dumpsys media.resource_manager
 adb -s <ip>:5555 shell "dumpsys media_session | grep -m1 PlaybackState"
 ```
 
+The timeout message itself tells you which of five different things actually happened — it is written to be pasted into a support thread, so paste the whole line:
+
+| the message says | what happened | what to do |
+|---|---|---|
+| `the whole budget went to connecting` | `adb connect` ate the entire `TUNE_TIMEOUT`; the box was never polled once. | Check the box is reachable and awake; raise `TUNE_TIMEOUT` if it is genuinely slow to accept connections. |
+| `every adb call to … failed or returned nothing` | adb never answered. | Check `TUNERn_IP` includes `:5555`, and that the box authorises this container's adb key. |
+| `never returned a dump this could read` | adb answered, but every dump arrived cut off or unreadable. | Run the manual `dumpsys` above and look at what comes back; a vendor build with a different format looks like this. |
+| `playback WAS seen but never held` | Detection fired but could not satisfy `CONFIRM` consecutive sightings past `MIN_WAIT` before time ran out. | Lower `CONFIRM` or `MIN_WAIT`, or raise `TUNE_TIMEOUT`. |
+| `nothing changed: baseline codec=… session=…` | adb worked the whole time and the box simply never started playing anything new. | The problem is upstream of streamgate — the tune script, the app, or the channel. `DEBUG=1` shows both signals per poll. |
+
+**Recordings start with the tail of the previous channel.** The gate isn't running. Look for `TUNERn_IP not set -- no gate` at tuner start — a missing or misspelled `TUNERn_IP` disables detection without failing anything.
+
 **Tunes are slower than they used to be.** Four things add deliberate delay after playback is detected: `SETTLE` (0.25s), the motion gate (up to `MOTION_TIMEOUT`), keyframe alignment (up to `ALIGN_TIMEOUT` + 2s), and `WAIT_AUDIO` if you enabled it. The `aligned` log line breaks this down — `gate-to-air` is the total and `waited-for-motion` is the motion gate's share. If `gate-to-air` is small and the tune still felt slow, the time went somewhere downstream of this program.
 
-**A flash at the head of the recording.** See above — raise `SETTLE`.
+**A flash at the head of the recording.** See above — raise `SETTLE`, or set `WAIT_AUDIO=1`.
 
 **Recording has sound but no picture.** Almost always upstream: confirm your encoder is actually carrying video. `ALIGN_KEYFRAME=0` will tell you quickly whether alignment is involved.
+
+**Recordings end early.** Look at the exit line. `encoder ended the stream after …` means the encoder closed the connection mid-recording; `READ_TIMEOUT` firing means it went silent while holding the connection open. Both are the encoder's doing — streamgate never ends a recording on its own.
+
+---
+
+## Building from source
+
+```sh
+go build -o streamgate .
+```
+
+No dependencies beyond the Go standard library; Go 1.21 or later. To cross-compile a static binary for the ah4c container, mirror what CI does:
+
+```sh
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+  -ldflags "-s -w -X main.version=$(git describe --tags --always)" -o streamgate .
+```
+
+(`GOARCH=arm64`, or `GOARCH=arm GOARM=7`, for the other release targets. The `-X main.version` stamp is what `--version` reports.)
+
+The test suite needs macOS or Linux: it fakes `adb` with a POSIX shell script installed on `PATH`, so on Windows the adb-harness half fails by construction while the parser and streaming tests still pass. CI runs the whole suite with the race detector on both the declared minimum Go version and the current one:
+
+```sh
+go test -race -count=1 ./...
+```
 
 ---
 
