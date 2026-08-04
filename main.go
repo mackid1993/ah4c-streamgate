@@ -572,7 +572,7 @@ func waitForVideo(ctx context.Context, c *config) error {
 					elapsed.Round(time.Millisecond), c.tunerIP)
 			}
 			if illegible > 0 && illegible+adbFailures == polls {
-				return fmt.Errorf("no playback after %v -- %s answered %d of %d polls but never returned a dump this could read (%d polls got no answer at all); try `adb -s %s shell dumpsys media.resource_manager`",
+				return fmt.Errorf("no playback after %v -- %s answered %d of %d polls but never returned a dump this could read (%d poll(s) got no answer at all); try `adb -s %s shell dumpsys media.resource_manager`",
 					elapsed.Round(time.Millisecond), c.tunerIP, illegible, polls, adbFailures, c.tunerIP)
 			}
 			if adbFailures == polls {
@@ -587,7 +587,7 @@ func waitForVideo(ctx context.Context, c *config) error {
 			// reached, or MIN_WAIT had not elapsed. It is the line people paste into
 			// a support thread, so it must not be a false statement about the box.
 			if sawPlaying {
-				return fmt.Errorf("no playback confirmed after %v (adb ok on %d/%d polls, base=%s) -- playback WAS seen but never held for CONFIRM=%d consecutive polls past MIN_WAIT=%v; lower CONFIRM or raise TUNE_TIMEOUT",
+				return fmt.Errorf("no playback confirmed after %v (adb ok on %d/%d polls, base=%s) -- playback WAS seen but never held for CONFIRM=%d consecutive polls past MIN_WAIT=%v; lower CONFIRM, lower MIN_WAIT, or raise TUNE_TIMEOUT",
 					elapsed.Round(time.Millisecond), polls-adbFailures, polls,
 					orNone(strings.Join(baseIDs, ",")), c.confirm, c.minWait)
 			}
@@ -721,15 +721,12 @@ func waitForVideo(ctx context.Context, c *config) error {
 		via := ""
 		playing := false
 		switch {
-		// `complete` as well: ids from a probe cut before the markers are a
-		// subset of the truth, which is safe against a SOUND baseline -- but
-		// against an empty baseline locked under the no-terminator latch, a
-		// truncated probe that kept its ids fired the gate on the outgoing
-		// channel through a shape the terminator-withdrawal cannot see (no
-		// terminator arrives on a probe with no tail). A complete probe carrying
-		// a terminator heals the latch in this same iteration, above, before
-		// this comparison runs. Costs one poll only when truncation lands on the
-		// exact poll that would have detected.
+		// `complete` as well: defence in depth. With the terminator-verified
+		// baseline this cannot currently be exploited -- truncated ids are a
+		// subset of the truth -- but the one class of bug this file kept
+		// regrowing was a sound rule at one site quietly depending on a guard at
+		// another. Costs one poll only when truncation lands on the exact poll
+		// that would have detected.
 		case haveCodecBase && complete && newCodec(ids, baseSet) != "":
 			playing, via = true, "codec "+newCodec(ids, baseSet)
 		case session == "playing" && armed:
@@ -794,8 +791,11 @@ func audioPiids(dump string) map[string]bool {
 		id := ""
 		if i := strings.Index(line, "piid:"); i >= 0 {
 			id = line[i+len("piid:"):]
-		} else if i := strings.Index(line, "ID:"); i >= 0 {
-			id = line[i+len("ID:"):]
+		} else if i := strings.Index(line, " ID:"); i >= 0 {
+			// Space-prefixed so "UID:10074" cannot masquerade as an id -- two
+			// tracks of one app share a uid, and keying on it would absorb the
+			// new track into the baseline.
+			id = line[i+len(" ID:"):]
 		}
 		if f := strings.Fields(id); len(f) > 0 {
 			out[strings.TrimRight(f[0], ",;")] = true

@@ -1641,3 +1641,22 @@ func TestRenderBaselineIsTakenAtDetectionTime(t *testing.T) {
 		t.Errorf("returned in %v; want the full RENDER_TIMEOUT spent refusing the old track", took)
 	}
 }
+
+// "UID:10074" contains "ID:" -- keying on it would give two tracks of one app
+// the same identity, absorbing the new track into the baseline. Only a
+// space-prefixed " ID:" (the toLogFriendlyString shape) is an id token.
+func TestAudioPiidsDoesNotMistakeUIDForAnID(t *testing.T) {
+	line := `  SomeShape UID:10074 state:started attr: usage=USAGE_MEDIA content=CONTENT_TYPE_MOVIE`
+	got := audioPiids(line)
+	if got["10074"] {
+		t.Fatalf("audioPiids keyed on the UID: %v", got)
+	}
+	if len(got) != 1 { // falls back to the line itself as the key
+		t.Fatalf("audioPiids = %v, want exactly the line-key fallback", got)
+	}
+	// And the real toLogFriendlyString shape still parses its ID.
+	friendly := `    ID:26 -- type: android.media.MediaPlayer -- state:started -- attr:AudioAttributes: usage=USAGE_MEDIA content=CONTENT_TYPE_MOVIE`
+	if got := audioPiids(friendly); !got["26"] {
+		t.Fatalf("audioPiids lost the toLogFriendlyString ID: %v", got)
+	}
+}

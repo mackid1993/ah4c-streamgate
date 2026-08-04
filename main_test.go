@@ -67,6 +67,8 @@ func TestEnvBool(t *testing.T) {
 // which would record a loading screen for the length of a programme.
 func TestOnTimeoutFailSafe(t *testing.T) {
 	os.Setenv("ENCODER9_URL", "http://x")
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
 	os.Args = []string{"streamgate", "9"}
 	for _, in := range []string{"fail", "fail ", `"fail"`, " FAIL "} {
 		os.Setenv("ON_TIMEOUT", in)
@@ -87,6 +89,8 @@ func TestOnTimeoutFailSafe(t *testing.T) {
 func TestAddressesAreUnquoted(t *testing.T) {
 	os.Setenv("TUNER9_IP", `"192.168.1.5:5555"`)
 	os.Setenv("ENCODER9_URL", " http://10.0.0.9/0.ts ")
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
 	os.Args = []string{"streamgate", "9"}
 	c, err := loadConfig()
 	if err != nil {
@@ -108,6 +112,8 @@ func TestTimeoutOrdering(t *testing.T) {
 	os.Setenv("ENCODER9_URL", "http://x")
 	os.Setenv("MOTION_TIMEOUT", "12")
 	os.Setenv("ALIGN_TIMEOUT", "8")
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
 	os.Args = []string{"streamgate", "9"}
 	c, err := loadConfig()
 	if err != nil {
@@ -639,6 +645,8 @@ func TestZeroWhereItIsDocumented(t *testing.T) {
 	os.Setenv("SETTLE", "0")
 	os.Setenv("DRAIN_IDLE", "0")
 	os.Setenv("POLL", "0")
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
 	os.Args = []string{"streamgate", "9"}
 	c, err := loadConfig()
 	if err != nil {
