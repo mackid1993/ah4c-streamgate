@@ -337,7 +337,13 @@ streamgate[1]: t=1.2s codec=abc123 base=abc123 session=stopped armed=true hits=0
 
 ## Troubleshooting
 
-**Which build am I running?** `streamgate --version`. Release binaries are stamped with their tag; a build from source reports `dev`.
+**Which build am I running?** `streamgate --version`:
+
+```
+streamgate 1.2.0 (bundled curl 8.21.0, linux/amd64)
+```
+
+Release binaries are stamped with their tag; a build from source reports `dev` unless you pass one. The curl version is on the same line because there is no curl on the host to check against — if the binary does not say which one it carries, nothing else can tell you. A build that bundles none (any non-Linux target) says so instead, and will fail at stream time.
 
 **There are `curl: (NN) …` lines in my logs.** Those are the bundled curl's own, and they are meant to be there — curl fetches the encoder, so when the fetch fails it reports the reason first and streamgate names the fault on the line below it. Paste both lines; between them they say exactly what happened.
 

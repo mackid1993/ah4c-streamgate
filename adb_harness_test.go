@@ -1382,6 +1382,17 @@ func TestMainConfigErrors(t *testing.T) {
 		if !strings.Contains(res.stderr, "streamgate") {
 			t.Errorf("stderr = %s", res.stderr)
 		}
+		// The line has to identify the curl inside, not just the build. There
+		// is no curl on the host to check against, so a deployed binary that
+		// does not say which one it carries cannot be identified at all --
+		// which is exactly how a build got installed that nobody could name.
+		if len(curlBin) > 0 {
+			if !strings.Contains(res.stderr, "bundled curl "+curlVersion) {
+				t.Errorf("--version does not name the bundled curl:\n%s", res.stderr)
+			}
+		} else if !strings.Contains(res.stderr, "no curl bundled") {
+			t.Errorf("--version does not say that no curl is bundled:\n%s", res.stderr)
+		}
 	})
 }
 

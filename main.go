@@ -37,6 +37,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -1758,7 +1759,18 @@ func main() {
 	signal.Ignore(syscall.SIGPIPE)
 
 	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
-		fmt.Fprintln(os.Stderr, "streamgate", version)
+		// The curl goes in the line too. A build stamp alone answers "which
+		// streamgate" but not "which curl is inside it", and the two are not
+		// separable at runtime -- there is no curl on the host to check. A
+		// build that bundles none says so rather than naming a version it
+		// cannot run.
+		if len(curlBin) > 0 {
+			fmt.Fprintf(os.Stderr, "streamgate %s (bundled curl %s, %s/%s)\n",
+				version, curlVersion, runtime.GOOS, runtime.GOARCH)
+		} else {
+			fmt.Fprintf(os.Stderr, "streamgate %s (no curl bundled for %s/%s -- not a release build)\n",
+				version, runtime.GOOS, runtime.GOARCH)
+		}
 		os.Exit(0)
 	}
 
