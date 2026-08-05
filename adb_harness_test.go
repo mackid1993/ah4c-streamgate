@@ -1199,24 +1199,29 @@ func TestMainOnTimeoutStreamWritesBytes(t *testing.T) {
 // A tune that never carried a picture must still put nothing on the wire, and
 // must name the encoder rather than the box.
 func TestMainEncoderFailures(t *testing.T) {
+	// An HTTP error and a silent encoder are different faults and must read
+	// differently. curl diagnoses the first -- its own line carries the status
+	// -- and streamgate turns the exit code into a sentence; reporting a 503
+	// as "sent no video" blamed the encoder for a silence that never happened.
 	cases := []struct {
 		name      string
 		handler   http.HandlerFunc
 		onTimeout string
 		wantLog   string
+		wantAlso  string // curl's own diagnosis, on the line above ours
 	}{
 		{"non-200, ON_TIMEOUT=fail", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusServiceUnavailable)
-		}, "fail", "encoder returned 503"},
+		}, "fail", "encoder refused the request", "503"},
 		{"non-200, ON_TIMEOUT=stream", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusServiceUnavailable)
-		}, "stream", "encoder returned 503"},
+		}, "stream", "encoder refused the request", "503"},
 		{"200 with an empty body, ON_TIMEOUT=fail", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
-		}, "fail", "encoder sent no video"},
+		}, "fail", "encoder sent no video", ""},
 		{"200 with an empty body, ON_TIMEOUT=stream", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
-		}, "stream", "encoder sent no video"},
+		}, "stream", "encoder sent no video", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1238,6 +1243,13 @@ func TestMainEncoderFailures(t *testing.T) {
 			}
 			if !strings.Contains(res.stderr, tc.wantLog) {
 				t.Errorf("stderr does not name the encoder fault %q:\n%s", tc.wantLog, res.stderr)
+			}
+			if tc.wantAlso != "" && !strings.Contains(res.stderr, tc.wantAlso) {
+				t.Errorf("stderr does not carry curl's own diagnosis %q:\n%s", tc.wantAlso, res.stderr)
+			}
+			// The opposite fault must not be claimed. A 503 is not silence.
+			if tc.wantAlso == "503" && strings.Contains(res.stderr, "sent no video") {
+				t.Errorf("an HTTP error was reported as the encoder sending nothing:\n%s", res.stderr)
 			}
 		})
 	}

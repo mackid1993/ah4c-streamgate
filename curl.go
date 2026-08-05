@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -86,11 +87,50 @@ func unpackCurl() (string, error) {
 }
 
 // curlStream is the encoder connection: curl's stdout, plus the process behind
-// it so Close can reap it.
+// it so its exit status can be read and Close can reap it.
 type curlStream struct {
 	io.ReadCloser
-	cmd *exec.Cmd
-	w   *os.File
+	cmd  *exec.Cmd
+	w    *os.File
+	once sync.Once
+	werr error
+}
+
+// Read turns curl's exit status into the error the stream ends with.
+//
+// Without this the pipe simply reaches EOF and every curl failure -- a 503, a
+// refused connection, a DNS miss -- was reported as "encoder sent no video
+// (EOF)". That names the wrong fault: the encoder answered, it just answered
+// with an error. curl's own message is already on stderr directly above, so
+// this adds the exit code and leaves the diagnosis to it.
+func (s *curlStream) Read(p []byte) (int, error) {
+	n, err := s.ReadCloser.Read(p)
+	if err == io.EOF {
+		if werr := s.wait(); werr != nil {
+			return n, werr
+		}
+	}
+	return n, err
+}
+
+func (s *curlStream) wait() error {
+	s.once.Do(func() { s.werr = s.cmd.Wait() })
+	var ee *exec.ExitError
+	if !errors.As(s.werr, &ee) {
+		return nil
+	}
+	switch code := ee.ExitCode(); code {
+	case 22:
+		// --fail turns any HTTP error status into this. curl printed the
+		// status itself on the line above.
+		return fmt.Errorf("encoder refused the request (bundled curl exit 22)")
+	case 7:
+		return fmt.Errorf("cannot reach the encoder (bundled curl exit 7)")
+	case 28:
+		return fmt.Errorf("encoder timed out (bundled curl exit 28)")
+	default:
+		return fmt.Errorf("bundled curl exited %d", code)
+	}
 }
 
 func (s *curlStream) Close() error {
@@ -103,7 +143,7 @@ func (s *curlStream) Close() error {
 	}
 	err := s.ReadCloser.Close()
 	_ = s.w.Close()
-	_ = s.cmd.Wait()
+	s.once.Do(func() { s.werr = s.cmd.Wait() })
 	return err
 }
 
