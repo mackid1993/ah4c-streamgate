@@ -23,13 +23,18 @@ const curlVersion = "8.21.0"
 const (
 	// cushionBuild is how long the encoder is left unconnected after the gate,
 	// filling its internal buffer with NEW-channel footage. Connecting then
-	// delivers that footage as an instant burst, and the player runs that far
-	// behind live for the whole session -- the cushion that absorbs hiccups.
-	// The wait does not slow the tune the way it looks like it should: the DVR
-	// probes the stream head before showing anything, and probing a burst
-	// completes in milliseconds where probing a live trickle costs its full
-	// length in real time.
-	cushionBuild = 2500 * time.Millisecond
+	// delivers that footage as an instant burst; the start point is the newest
+	// clean keyframe in it. The wait does not slow the tune the way it looks
+	// like it should: the DVR probes the stream head before showing anything,
+	// and probing a burst completes in milliseconds where probing a live
+	// trickle costs its full length in real time.
+	//
+	// Sized so the safe window (cushionBuild - renderMargin) spans at least
+	// one full GOP of a 60fps/120-frame encoder -- 2 seconds, the common
+	// ceiling. A window narrower than the GOP contains no keyframe on some
+	// tunes, and those fall to the live-align path: slower first picture and
+	// no cushion at all.
+	cushionBuild = 3 * time.Second
 	// renderMargin is clipped off the oldest end of the kept footage. The gate
 	// fires on decoder allocation, which runs 0.6-0.8s ahead of the first
 	// rendered pixel on this hardware, so the first moments after the gate can

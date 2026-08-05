@@ -121,8 +121,10 @@ clean *and* buffer-resistant at once:
 
 1. **The encoder is left unconnected until after the gate.** While streamgate
    watches the box, the encoder quietly fills its internal buffer with footage
-   of the *new* channel playing. streamgate then waits a further ~2.5s on
-   purpose before connecting, so that buffer holds a run of clean footage.
+   of the *new* channel playing. streamgate then waits a further ~3s on
+   purpose before connecting, so that buffer holds a run of clean footage
+   spanning at least one full GOP even on a 60fps encoder with a 2-second
+   keyframe cycle.
 
 2. **The burst is trimmed to the newest clean keyframe.** When curl connects,
    that buffer arrives in one burst. streamgate reads the stream's own clock
@@ -131,11 +133,15 @@ clean *and* buffer-resistant at once:
    margin, so the channel-change tail structurally cannot reach the output.
    From what survives it starts on the **newest** keyframe, with the newest
    PAT/PMT in front. You therefore run behind live only by the distance from
-   that keyframe to the live edge — bounded by your encoder's GOP cycle,
-   typically well under a second. That same distance is your stall cushion:
-   latency behind live and hiccup protection are physically the same footage,
-   and starting on the newest clean keyframe is as close to live as a clean
-   start can possibly be.
+   that keyframe to the live edge — a random point inside one GOP of your
+   encoder, so a 2-second GOP (the 60fps default on many encoders) averages
+   about a second and a short GOP proportionally less. That same distance is
+   your stall cushion: latency behind live and hiccup protection are
+   physically the same footage, and starting on the newest clean keyframe is
+   as close to live as a clean start can possibly be. **The one lever that
+   genuinely shrinks it is your encoder's GOP setting** — at 60fps, a
+   60-frame GOP halves the bound to 1s and a 30-frame GOP to 0.5s, at the
+   cost of a little compression efficiency.
 
 3. **Then streamgate gets out of the way.** After the head, bytes pass through
    untouched — a straight copy of curl's output.
