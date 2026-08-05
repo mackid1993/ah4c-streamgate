@@ -14,7 +14,7 @@ The video is never re-encoded. The encoder's bytes go through untouched.
 
 Three properties hold on every code path. They are structural, not configuration:
 
-- **stdout carries nothing but stream bytes.** Every log line goes to stderr. There is no mode, flag or failure in which diagnostics can leak into the recording.
+- **stdout carries nothing but stream bytes.** The stream is fetched by the bundled curl and written to stdout untouched after the head trim; every log line — streamgate's and curl's — goes to stderr. There is no mode, flag or failure in which diagnostics can leak into the recording.
 - **It never emits picture from before the gate opened.** The connect burst is trimmed on the stream's own clock so that only footage younger than the gate (plus a render margin) survives, and when the stream carries no clock to trim by, the whole burst is discarded rather than trusted. The one exception is the cached PAT/PMT injected at the head — program tables, not video. *(The ungated modes — no `TUNERn_IP`, or `ON_TIMEOUT=stream` — send whatever is on screen by definition, as they always did.)*
 - **It never re-encodes, remuxes or edits.** Once the first byte is out, everything passes through byte-exact.
 
@@ -51,7 +51,7 @@ streamgate is wired in per tuner with three environment variables, set on the ah
 | `ENCODERn_URL` | yes | The HTTP URL of tuner *n*'s encoder stream. If it's missing, streamgate exits immediately with a configuration error. |
 | `TUNERn_IP` | yes, in practice | The Android box's network address, **including the port** (`:5555`). A missing or misspelled `TUNERn_IP` is *not* fatal: that tuner logs `TUNERn_IP not set -- no gate` once and then streams ungated — so it records the head of the previous channel on every tune, indefinitely, with no other complaint. Check the spelling. |
 
-How the hook works: ah4c pipes `CMDn`'s stdout to your DVR — whatever the command writes *is* the stream, and a command that exits without writing fails the tune. streamgate withholds stdout while it watches the box, then streams the encoder once playback is real. Two things follow from how ah4c runs the command: it is **exec'd directly, not run through a shell** (no `$VAR` expansion, no pipes — a binary plus a number is the clean form), and it **starts before your tune script fires**, which is deliberate: streamgate snapshots what the *previous* channel was doing so it can tell that apart from the new one.
+How the hook works: ah4c pipes `CMDn`'s stdout to your DVR — whatever the command writes *is* the stream, and a command that exits without writing fails the tune. streamgate writes nothing while it watches the box; once playback is real it has the bundled curl fetch the encoder and puts that stream on stdout, trimmed to start clean (see "How the stream is delivered" below). Two things follow from how ah4c runs the command: it is **exec'd directly, not run through a shell** (no `$VAR` expansion, no pipes — a binary plus a number is the clean form), and it **starts before your tune script fires**, which is deliberate: streamgate snapshots what the *previous* channel was doing so it can tell that apart from the new one.
 
 ### In an env file
 
