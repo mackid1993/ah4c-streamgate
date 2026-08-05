@@ -156,10 +156,16 @@ func TestDeliverTrimsPreGateFootage(t *testing.T) {
 	if !ok {
 		t.Fatal("no PCR at or after the start point")
 	}
+	// The start must be the NEWEST safe keyframe: in this fixture keyframes are
+	// 0.625s apart, so the distance behind live can never legitimately reach a
+	// full spacing plus the tail -- and it must still be new-channel footage,
+	// inside the safe window.
 	age := 5.0 - startPCR
-	if age < 0.8 || age > 2.0 {
-		t.Errorf("start is %.2fs behind the live edge; want a cushion near %.2fs",
-			age, (cushionBuild - renderMargin).Seconds())
+	if age < 0 || age > 0.9 {
+		t.Errorf("start is %.2fs behind the live edge; want the newest clean keyframe (under one 0.625s GOP)", age)
+	}
+	if age > (cushionBuild - renderMargin).Seconds() {
+		t.Errorf("start is %.2fs old, outside the %.2fs safe window", age, (cushionBuild - renderMargin).Seconds())
 	}
 }
 

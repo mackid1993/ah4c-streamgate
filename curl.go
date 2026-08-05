@@ -224,8 +224,9 @@ func deliver(c *config, pipe io.Reader, trim bool) (wrote bool, err error) {
 		return false, fmt.Errorf("encoder sent no video (%w)", readErr)
 	}
 
-	// Phase 2: find the cut. Everything older than the kept window is from
-	// before the gate (plus the render margin) and is discarded unseen.
+	// Phase 2: find the safe boundary. Everything older than the safe window
+	// is from before the gate (plus the render margin) and is discarded
+	// unseen, whatever it contains.
 	keep := (cushionBuild - renderMargin).Seconds()
 	var firstPCR, lastPCR float64
 	havePCR := false
@@ -258,9 +259,13 @@ func deliver(c *config, pipe io.Reader, trim bool) (wrote bool, err error) {
 		}
 	}
 
-	// Phase 3: cache the newest tables seen up to the cut, then start on the
-	// first keyframe at or after it. The table and keyframe machinery is the
-	// same code the internal path proved out.
+	// Phase 3: cache the newest tables, then start on the NEWEST keyframe in
+	// the safe region -- not the oldest. Latency behind live and stall cushion
+	// are the same number (the footage between the start keyframe and the live
+	// edge), and the newest clean keyframe minimises it: the tune starts as
+	// close to live as a clean start structurally allows, bounded by the
+	// encoder's own GOP spacing. The table and keyframe machinery is the same
+	// code the internal path proved out.
 	var lastPAT, lastPMT []byte
 	pmtPids := map[uint16]bool{}
 	vidPids := map[uint16]bool{}
@@ -290,7 +295,7 @@ func deliver(c *config, pipe io.Reader, trim bool) (wrote bool, err error) {
 	for i := 0; i+tsPacketSize <= len(backlog); i += tsPacketSize {
 		p := backlog[i : i+tsPacketSize]
 		scanPSI(p)
-		if kf < 0 && i >= cut && alignCandidate(p, pid(p), vidPids, pmtPids) {
+		if i >= cut && alignCandidate(p, pid(p), vidPids, pmtPids) {
 			kf = i
 		}
 	}
@@ -316,8 +321,8 @@ func deliver(c *config, pipe io.Reader, trim bool) (wrote bool, err error) {
 				cushion = lastPCR - v
 			}
 		}
-		logf(c, "aligned in the connect burst: kept %.0fKB (~%.1fs cushion), discarded %.0fKB of pre-gate footage",
-			float64(len(backlog)-kf)/1024, cushion, float64(kf)/1024)
+		logf(c, "aligned in the connect burst: kept %.0fKB (~%.1fs behind live, which is also the stall cushion), discarded %.0fKB pre-gate and %.0fKB behind the newest clean keyframe",
+			float64(len(backlog)-kf)/1024, cushion, float64(cut)/1024, float64(kf-cut)/1024)
 		if werr := emit(backlog[kf:]); werr != nil {
 			return wrote, werr
 		}

@@ -124,15 +124,18 @@ clean *and* buffer-resistant at once:
    of the *new* channel playing. streamgate then waits a further ~2.5s on
    purpose before connecting, so that buffer holds a run of clean footage.
 
-2. **The connect burst becomes your cushion.** When curl connects, that buffer
-   arrives in one burst. streamgate reads the stream's own clock (the PCR) and
-   discards everything older than the kept window — which by construction
-   covers every byte from before the gate plus a 0.75s render margin, so the
-   channel-change tail structurally cannot reach the output. What survives is
-   ~1.75s of new-channel footage, emitted from its first keyframe with the
-   newest PAT/PMT in front. Your player starts with that cushion in hand and
-   runs behind live by exactly that much for the whole session: brief encoder
-   or source hiccups drain the cushion instead of stalling playback.
+2. **The burst is trimmed to the newest clean keyframe.** When curl connects,
+   that buffer arrives in one burst. streamgate reads the stream's own clock
+   (the PCR) and discards everything older than the safe window — which by
+   construction covers every byte from before the gate plus a 0.75s render
+   margin, so the channel-change tail structurally cannot reach the output.
+   From what survives it starts on the **newest** keyframe, with the newest
+   PAT/PMT in front. You therefore run behind live only by the distance from
+   that keyframe to the live edge — bounded by your encoder's GOP cycle,
+   typically well under a second. That same distance is your stall cushion:
+   latency behind live and hiccup protection are physically the same footage,
+   and starting on the newest clean keyframe is as close to live as a clean
+   start can possibly be.
 
 3. **Then streamgate gets out of the way.** After the head, bytes pass through
    untouched — a straight copy of curl's output.
@@ -208,8 +211,8 @@ What each number means:
 |---|---|
 | `playback detected after Ns` | time from the tuner being reserved until a decoder appeared. Mostly the box and the app; not much to do with this program. |
 | `via codec … (base …)` | which signal fired. `base` is what was allocated before tuning — a *changed* id is the proof of new playback. |
-| `kept … (~Ns cushion)` | **the number to watch.** How much clean footage the tune started with — the buffer between you and every upstream hiccup. Zero-ish across many tunes means your encoder buffers very little; the cushion can never exceed what the encoder holds. |
-| `discarded … of pre-gate footage` | the part of the connect burst that was older than the gate plus the render margin — the channel-change tail your recording must never open on. |
+| `kept … (~Ns behind live, which is also the stall cushion)` | **the number to watch.** How far behind live the tune starts, which is identically how much upstream hiccup it can absorb — the two are the same footage. It is the distance from the newest clean keyframe to the live edge, so it is bounded by your encoder's GOP cycle and varies tune to tune. |
+| `discarded … pre-gate and … behind the newest clean keyframe` | the two parts of the connect burst that are dropped: footage older than the gate plus the render margin (the channel-change tail your recording must never open on), and safe footage superseded by a newer keyframe. |
 
 When the burst can't be used:
 
@@ -279,7 +282,7 @@ streamgate[1]: t=1.2s codec=abc123 base=abc123 session=stopped armed=true hits=0
 
 **Recording has sound but no picture.** Almost always upstream: confirm your encoder is actually carrying video.
 
-**Live TV still buffers.** Check the `kept … cushion` figure on the aligned line. A cushion near zero means your encoder holds almost nothing in its own buffer (the cushion can never exceed it), or the stream carries no PCR clock to trim by — the `no usable PCR clock` line says so explicitly. In either case the hiccups are real and upstream; the cushion was masking them, not causing them.
+**Live TV still buffers.** Check the `kept … stall cushion` figure on the aligned line. The cushion equals the distance behind live — one second of protection costs one second of latency; that trade is physics, not implementation — and this build keeps it as small as a clean start allows, so it only absorbs hiccups shorter than roughly one GOP. If your upstream stalls for longer than the figure in the log, the spinner is real and upstream: a longer encoder GOP would deepen the cushion (at matching latency), and encoder-side fixes (CBR instead of VBR, a stable HDMI link) shrink the stalls themselves — the only cure that costs no latency at all. A stream with no PCR clock gets no cushion at all; the `no usable PCR clock` line says so explicitly.
 
 **Recordings end early.** Look at the exit line. `encoder ended the stream` means the encoder closed the connection mid-recording; `encoder fell below 1000 B/s` means it went (nearly) silent while holding the connection open. Both are the encoder's doing — streamgate never ends a recording on its own.
 
