@@ -15,7 +15,7 @@ The video is never re-encoded. The encoder's bytes go through untouched.
 Three properties hold on every code path. They are structural, not configuration:
 
 - **stdout carries nothing but stream bytes.** Every log line goes to stderr. There is no mode, flag or failure in which diagnostics can leak into the recording.
-- **It never emits picture from before the gate opened.** It only ever discards forward. The one exception is the cached PAT/PMT injected at the head — program tables, not video — so it is structurally incapable of introducing a channel-change banner, a tuning prompt or a transition frame that a plain byte-copy would not also have delivered.
+- **It never emits picture from before the gate opened.** It only ever discards forward. The one exception is the cached PAT/PMT injected at the head — program tables, not video — so it is structurally incapable of introducing a channel-change banner, a tuning prompt or a transition frame that a plain byte-copy would not also have delivered. *(Default delivery only: `DELIVERY=curl` deliberately trades this guarantee for a live cushion — see "Bundled curl delivery" below.)*
 - **It never re-encodes, remuxes or edits.** Once the first byte is out, everything passes through byte-exact.
 
 ---
@@ -169,6 +169,37 @@ optimisation:
 
 Motion seen *before* the gate — the wake animation, the home screen, the app launching, the channel you're leaving — is never evidence about the new channel, so the latch is always dropped when the gate opens and motion must prove itself again on the new picture. The learned floor is kept, so a warm tune re-latches within `MOTION_HOLD` windows (~750ms at defaults, usually inside the keyframe wait it already pays) while the card, sitting at the floor, cannot. `REARM_MOTION=1` additionally forgets the floor itself — for apps whose pre-gate picture is so quiet that a kept floor would let the card read as a rise. Off by default; the same trade-off note below applies.
 
+## Bundled curl delivery
+
+`DELIVERY=curl` changes who moves the stream once the gate opens: streamgate
+unpacks a statically linked curl 8.21.0 that is compiled into the binary and
+hands it stdout directly. ah4c treats the command's stdout as the tuner
+stream, so from that moment curl's output *is* the stream — detection and the
+gate work exactly as before, and then streamgate steps out of the byte path
+entirely.
+
+The difference that matters is **when the encoder is connected**. The default
+path opens the encoder connection immediately and reads it through the whole
+detection wait, so playback starts at the live edge with no slack behind it.
+`DELIVERY=curl` connects only when the gate opens — exactly as the original
+shell script did — so everything the encoder buffered during the wait arrives
+in one burst, and your player runs that far behind live for the whole session.
+That backlog is a **cushion**: brief encoder or source hiccups drain it
+instead of stalling playback. If live TV through streamgate buffers where the
+shell script never did, this setting is the difference.
+
+What it trades away, honestly: the buffered backlog is footage from *before*
+the gate opened, so the head of a tune can show the tail of the channel change
+— the shell-era behaviour this binary's default path was built to eliminate.
+Keyframe alignment, table injection, the motion gate and the catch-up drain do
+not run in this mode, and their settings are inert (`ALIGN_KEYFRAME`,
+`ALIGN_TIMEOUT`, `WAIT_MOTION` and its companions, `DRAIN_IDLE`); the DVR
+locks on wherever it finds tables and a keyframe, as it always did with the
+shell script. `SETTLE` still applies — it runs before the gate. `READ_TIMEOUT`
+still applies, mapped onto curl's own low-speed abort: below 1000 bytes/s for
+that long ends the tune, so a wedged encoder cannot hold the tuner slot
+forever.
+
 ## Optional settings
 
 Everything here is optional, set the same way as the tuner variables — in the env file or under `environment:` in compose. Durations accept either seconds (`5`, `0.25`) or Go syntax (`10s`, `250ms`). A value that can't be parsed is ignored with a warning on stderr rather than silently falling back.
@@ -183,6 +214,7 @@ The defaults are tuned; most people should never touch these.
 
 | Variable | Default | What it does |
 |---|---|---|
+| `DELIVERY` | `internal` | `curl` hands the stream to the bundled static curl, connected only at gate time — restores the shell-era delivery and its live cushion. See "Bundled curl delivery" above. An unrecognised value warns and keeps `internal`. |
 | `CONFIRM` | `1` | Consecutive sightings required before handing off. Raise to `2`+ if a splash frame slips through. |
 | `POLL` | `0.25` | Seconds between polls while waiting for a first sighting. |
 | `CONFIRM_POLL` | `0.05` | Seconds between polls once something has been sighted. Confirming is on the critical path, so it polls tight. |
@@ -268,6 +300,10 @@ streamgate[1]: no playback after 40s (adb ok on 158/160 polls) -- nothing change
 | `stream closed by the DVR` | The normal end of every recording — the DVR hung up. Exits 0. |
 | `render confirmed after a further Nms` / `render not confirmed within Ns` | The `WAIT_AUDIO` gate: the new tune's audio track started, or the cap expired and the gate opened anyway. |
 | `no whole audio dump in 3 attempts; render falls back to any started media track` | The `WAIT_AUDIO` baseline could not be verified whole; the gate degrades to the identity-blind check rather than waiting on a baseline it cannot trust. |
+| `handing the stream to bundled curl …` | `DELIVERY=curl`: the gate opened and the bundled curl now owns delivery; nothing after this line is streamgate's doing except reporting how curl exited. curl runs with its errors visible, so a fetch problem prints curl's own message alongside streamgate's. |
+| `bundled curl exited cleanly -- the encoder ended the stream` | `DELIVERY=curl`: the encoder closed the connection. Exits 0 — with curl in charge, streamgate cannot distinguish a truncated recording from a normal end. |
+| `encoder fell below 1000 B/s for Ns (bundled curl exit 28)` | `DELIVERY=curl`'s equivalent of `READ_TIMEOUT` firing: the encoder went (nearly) silent, curl aborted, and the tune ends. Exits 1. |
+| `bundled curl exited N` | `DELIVERY=curl`: curl failed some other way — its stderr message directly above says why. Exits 1. |
 | `raising MOTION_HOLD=N to 2 …` | A configured value below the structural floor was clamped, not defaulted. |
 | `ignoring X="…" -- …; using the default` | A setting failed to parse. The line says exactly which value and why. |
 
@@ -312,6 +348,8 @@ streamgate[1]: t=1.2s codec=abc123 base=abc123 session=stopped armed=true hits=0
 **A flash at the head of the recording.** See above — raise `SETTLE`, or set `WAIT_AUDIO=1`.
 
 **Recording has sound but no picture.** Almost always upstream: confirm your encoder is actually carrying video. `ALIGN_KEYFRAME=0` will tell you quickly whether alignment is involved.
+
+**Live TV buffers where the shell script never did.** The default path starts playback at the live edge with no slack behind it, so hiccups your encoder's buffer used to absorb become visible stalls. Set `DELIVERY=curl` — see "Bundled curl delivery" for exactly what that restores and what it trades.
 
 **Recordings end early.** Look at the exit line. `encoder ended the stream after …` means the encoder closed the connection mid-recording; `READ_TIMEOUT` firing means it went silent while holding the connection open. Both are the encoder's doing — streamgate never ends a recording on its own.
 

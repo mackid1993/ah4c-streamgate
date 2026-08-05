@@ -38,6 +38,18 @@ file, because `core.autocrlf` puts CRLF in the working tree; verify formatting
 against LF-normalised copies — the committed content is LF and CI's gofmt gate
 is the authority.
 
+## Bundled curl
+
+`third_party/` carries pinned static curl binaries (musl builds; provenance
+and checksums in `third_party/README.md`), embedded per release architecture
+by the build-tagged `curl_embed_*.go` files and unpacked at runtime by
+`DELIVERY=curl`. Non-linux builds embed nothing and fail that mode loudly at
+runtime. To update: fetch the new release's musl tarballs, verify each `curl`
+against the SHA256SUMS inside its tarball, replace the binaries, bump
+`curlVersion` in `curl.go`, and refresh the provenance table.
+`TestBundledCurlRuns` execs the embedded binary, so it only runs on linux —
+one more reason the manual CI dispatch is the release gate.
+
 ## CI and releases
 
 `.github/workflows/build.yml` runs on `workflow_dispatch` only — nothing runs
