@@ -171,6 +171,26 @@ optimisation:
 
 Motion seen *before* the gate — the wake animation, the home screen, the app launching, the channel you're leaving — is never evidence about the new channel, so the latch is always dropped when the gate opens and motion must prove itself again on the new picture. The learned floor is kept, so a warm tune re-latches within `MOTION_HOLD` windows (~750ms at defaults, usually inside the keyframe wait it already pays) while the card, sitting at the floor, cannot. `REARM_MOTION=1` additionally forgets the floor itself — for apps whose pre-gate picture is so quiet that a kept floor would let the card read as a rise. Off by default; the same trade-off note below applies.
 
+## The bundled curl
+
+streamgate does not speak HTTP to your encoder itself. It carries a **static build of curl 8.21.0**, embedded in the binary, and uses that to fetch the stream.
+
+The reason is unglamorous: encoders are not well-behaved HTTP servers. Redirects, chunked transfer, connection reuse, half-closes and various small non-compliances are all things curl has spent thirty years learning to survive, and reimplementing that is not this program's job.
+
+**What you will see, and why it is normal:**
+
+- **A `curl` process for each tuner that is streaming.** One per active tune, exiting with it.
+- **A file at `/tmp/streamgate-curl-8.21.0`.** The embedded binary is unpacked there on the first tune and reused by every tune after it, so a container that tunes thousands of times leaves one file rather than thousands. Deleting it is harmless; it comes back.
+- **`curl: (NN) …` lines on stderr.** curl's own diagnostics, sitting directly above streamgate's. See Troubleshooting.
+
+**curl fetches, but it never writes to your DVR.** Its output goes into a pipe that streamgate reads, packet by packet — not straight to the recording. That distinction is what pays for everything above: the pre-gate discard, keyframe alignment and the motion gate are only possible because the bytes pass through this program on the way. Handing the descriptor to curl directly would be less code and would deliver the encoder's pre-gate buffer verbatim, channel-change banner and all.
+
+Two timeouts apply. curl gives up if the connection takes more than 5 seconds to establish; `READ_TIMEOUT` is enforced by streamgate over the whole connection once it is open.
+
+There is one binary per release architecture (`amd64`, `arm64`, `armv7`), all Linux. The provenance and SHA-256 checksums are recorded in `third_party/README.md` in the source tree, alongside curl's licence. Builds for any other platform bundle nothing and fail loudly at stream time rather than pretending.
+
+---
+
 ## If the encoder goes quiet
 
 **streamgate passes data through.** It does not buffer, pad, pace, or manufacture packets. What the encoder sends is what your DVR gets, and when the encoder sends nothing, nothing is what goes out. Holding video back to smooth it over would put streamgate between you and live TV, which is the one thing it is built not to do.
