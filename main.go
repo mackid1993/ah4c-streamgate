@@ -1302,6 +1302,13 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) (wrote boo
 			// first put those bytes on the wire for a tune that then reported it had
 			// sent no video. Nothing goes out on a tune that carried no picture.
 			if !wrote {
+				// An error that already names the encoder's fault is returned
+				// as it stands. Wrapping a 503 in "sent no video" reported a
+				// silence that never happened.
+				var ef encoderFault
+				if errors.As(err, &ef) {
+					return wrote, err
+				}
 				return wrote, fmt.Errorf("encoder sent no video (%v)", err)
 			}
 			// Prefer a failed final flush to the read error: if the DVR hung up, that

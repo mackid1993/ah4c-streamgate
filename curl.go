@@ -113,6 +113,13 @@ func (s *curlStream) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// encoderFault is an error that already names what the encoder did. Callers
+// must return it as-is rather than wrapping it in a diagnosis of their own --
+// "encoder sent no video" on top of a 503 names a silence that never happened.
+type encoderFault struct{ s string }
+
+func (e encoderFault) Error() string { return e.s }
+
 func (s *curlStream) wait() error {
 	s.once.Do(func() { s.werr = s.cmd.Wait() })
 	var ee *exec.ExitError
@@ -123,13 +130,13 @@ func (s *curlStream) wait() error {
 	case 22:
 		// --fail turns any HTTP error status into this. curl printed the
 		// status itself on the line above.
-		return fmt.Errorf("encoder refused the request (bundled curl exit 22)")
+		return encoderFault{"encoder refused the request (bundled curl exit 22)"}
 	case 7:
-		return fmt.Errorf("cannot reach the encoder (bundled curl exit 7)")
+		return encoderFault{"cannot reach the encoder (bundled curl exit 7)"}
 	case 28:
-		return fmt.Errorf("encoder timed out (bundled curl exit 28)")
+		return encoderFault{"encoder timed out (bundled curl exit 28)"}
 	default:
-		return fmt.Errorf("bundled curl exited %d", code)
+		return encoderFault{fmt.Sprintf("bundled curl exited %d", code)}
 	}
 }
 
