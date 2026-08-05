@@ -281,7 +281,11 @@ streamgate[1]: no playback after 40s (adb ok on 158/160 polls) -- nothing change
 | `no 188-byte sync grid in this stream; accepting bare sync bytes` | The response body doesn't look like MPEG-TS. streamgate relaxes rather than emit nothing, but check what the encoder URL actually returns — an HTML error page is a common culprit. |
 | `no picture on the PMT-declared video pids for Ns; accepting any non-padding packet` | The stream's own PMT names a video PID the mux never carries. Observation outranks the table: streamgate stops trusting the PMT once, then fails only if there is still no picture. |
 | `encoder sent no picture for Ns, only padding and tables` | The encoder is muxing with nothing on its input — null padding and SI tables, no video. Exits 1 rather than shipping a dead mux to the DVR for the length of a programme. Check the HDMI input. |
-| `encoder sent no video (…)` | The encoder answered and then ended or died before a single video byte. Exits 1; nothing was written. |
+| `encoder sent no video (…)` | The encoder answered 200 and then ended or died before a single video byte — a genuine silence. Exits 1; nothing was written. |
+| `encoder refused the request (bundled curl exit 22)` | The encoder answered with an HTTP error. The line directly above is curl's, and it names the status — a `503` here usually means every session on that encoder is already in use. |
+| `cannot reach the encoder (bundled curl exit 7)` | Nothing answered at `ENCODERn_URL`. Check the address and that the encoder is powered up. |
+| `encoder timed out (bundled curl exit 28)` | Either the connection took more than 5s to establish, or the transfer stalled. curl's line above says which. |
+| `bundled curl exited N` | Any other curl failure. Its own message sits directly above with the detail. |
 | `encoder ended the stream after X and Y MB` | The encoder closed mid-recording. However politely it closed, that truncates the recording, so it is logged and exits 1. |
 | `gap in the encoder's output: Ns` | The encoder stopped sending for longer than 150ms, then resumed. One line per gap. Nothing was done about it — see "If the encoder goes quiet". |
 | `encoder sent nothing for Ns` | The silence outran `READ_TIMEOUT`, so the tune failed rather than holding the tuner on a stream that was not coming back. |
@@ -314,6 +318,8 @@ streamgate[1]: t=1.2s codec=abc123 base=abc123 session=stopped armed=true hits=0
 ## Troubleshooting
 
 **Which build am I running?** `streamgate --version`. Release binaries are stamped with their tag; a build from source reports `dev`.
+
+**There are `curl: (NN) …` lines in my logs.** Those are the bundled curl's own, and they are meant to be there — curl fetches the encoder, so when the fetch fails it reports the reason first and streamgate names the fault on the line below it. Paste both lines; between them they say exactly what happened.
 
 **Every tune times out.** The timeout message tells you which of five different things actually happened — it is written to be pasted into a support thread, so paste the whole line:
 
