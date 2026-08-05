@@ -1160,10 +1160,10 @@ func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) (wrote boo
 	// -- with nothing left in the process able to discard it. Staying in the
 	// path is what pays for the alignment below and the stall filling here.
 	//
-	// READ_TIMEOUT is enforced by the stall reader, over the whole connection:
-	// short silences are filled with null packets so the DVR never sees the
-	// bitstream stop, and quiet that outruns the budget fails the read.
-	sr := newStallReader(c, body, stallGap, c.readTimeout)
+	// READ_TIMEOUT is enforced here, over the whole connection: quiet that
+	// outruns the budget fails the read. Nothing is synthesised on this side --
+	// everything below parses only what the encoder actually sent.
+	sr := newIdleReader(c, body, c.readTimeout)
 
 	sent := 0
 	// 8KB, not 64KB. Whatever sits in this buffer is video we have taken off the

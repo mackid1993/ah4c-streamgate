@@ -53,19 +53,32 @@ alignment and the pre-gate discard.
 `init` in `main_test.go` deliberately leaves it alone under `SG_SUBPROCESS=1`,
 so the harness exercises the real curl path.
 
-`stallReader` fills silences longer than `stallGap` (500ms) with PID 0x1FFF
-packets, bounded by `READ_TIMEOUT`. The emit loop already excludes 0x1FFF from
-motion accounting, alignment candidates and the picture test, so filled packets
-pass through without disturbing any of it.
+`idleReader` enforces `READ_TIMEOUT` over curl's pipe (the socket deadline the
+in-process path uses is not available there) and logs any encoder silence past
+`gapReport`. It synthesises nothing.
 
-Do not write this up as the fix for the reported buffering: no gap has ever
-been measured, and the causal claim is not established. It is a safety net plus
-a probe -- every filled gap is logged once, so a stutter with no such line
-rules out the encoder going quiet. Earlier sessions burned a lot of time on
-delivery theories (a lost "cushion", late-vs-early connect) that David's own
-evidence disproved; do not revive them, and do not anchor this feature's
-justification on ah4c's `NULL_FRAME_INSERTION`, which is an encoder-reboot
-survival mechanism and unrelated to playback smoothness.
+**streamgate passes data through and must stay that way.** It does not buffer,
+pad, pace or manufacture packets -- that is the maintainer's explicit
+constraint, not an implementation detail. Two attempts to add bytes have
+already been reverted:
+
+- Null-filling gaps. Wrong twice over. Injected packets went through
+  `readPacket` like real ones, so synthetic data drove streamgate's own state
+  machine -- the `ALIGN_TIMEOUT` fallback fired during a silence instead of
+  waiting for the encoder, which `TestNoVideoMeansNoBytes` caught. And a null
+  packet carries no frame, so filling a gap cannot stop a player stuttering
+  through it. ah4c handles null insertion itself; streamgate must not
+  second-guess it.
+- Adding read/emit slack to smooth jitter. Rejected outright: it puts
+  streamgate between the user and live TV.
+
+Do not make claims in this repo about ah4c's internals. Several have been
+asserted here and been wrong; the maintainer wrote that code and is the
+authority on it. Likewise, do not attribute the reported buffering to any
+cause without a measurement -- a lost "cushion" and late-vs-early connect were
+each built up and then disproven by his own evidence. The gap log exists to
+produce the missing measurement: a stutter with no gap line rules out the
+encoder going quiet.
 
 `third_party/` carries pinned static curl binaries (musl builds; provenance and
 checksums in `third_party/README.md`), embedded per release architecture by the

@@ -37,41 +37,32 @@ func TestBundledCurlRuns(t *testing.T) {
 	}
 }
 
-// An encoder that goes quiet must not take the bitstream down with it: the gap
-// is filled with null packets so the DVR keeps receiving. This is the whole
-// reason streamgate stays in the byte path.
-func TestStallReaderFillsGapsWithNulls(t *testing.T) {
+// streamgate passes data through; it does not manufacture any. An earlier
+// version filled encoder silences with null packets, and those packets went
+// through readPacket exactly like real ones -- so synthetic data drove
+// streamgate's own state machine and the ALIGN_TIMEOUT fallback fired during a
+// silence instead of waiting for the encoder. A silent encoder must produce a
+// failure, never invented bytes.
+func TestIdleReaderNeverSynthesises(t *testing.T) {
 	pr, pw := io.Pipe()
 	defer pw.Close()
-	sr := newStallReader(&config{tuner: "T"}, pr, 20*time.Millisecond, 5*time.Second)
+	r := newIdleReader(&config{tuner: "T"}, pr, 200*time.Millisecond)
 
-	b := make([]byte, tsPacketSize)
-	start := time.Now()
-	n, err := sr.Read(b)
-	if err != nil {
-		t.Fatalf("read during a stall: %v", err)
+	b := make([]byte, 4096)
+	n, err := r.Read(b)
+	if err == nil {
+		t.Fatalf("a silent encoder produced %d bytes; nothing may be invented here", n)
 	}
-	if n != tsPacketSize {
-		t.Fatalf("filled %d bytes, want one %d-byte packet", n, tsPacketSize)
-	}
-	if b[0] != 0x47 {
-		t.Errorf("fill does not start on a sync byte: %#x", b[0])
-	}
-	if got := pid(b); got != 0x1fff {
-		t.Errorf("fill has pid %#x, want the null pid 0x1fff", got)
-	}
-	// It must wait for the gap before filling, not fill eagerly -- otherwise a
-	// healthy stream gets nulls interleaved into it for no reason.
-	if elapsed := time.Since(start); elapsed < 20*time.Millisecond {
-		t.Errorf("filled after %v, before the %v gap had elapsed", elapsed, 20*time.Millisecond)
+	if !strings.Contains(err.Error(), "sent nothing") {
+		t.Errorf("failed with %v, want the silence to be named", err)
 	}
 }
 
-// A stream that is flowing must pass through untouched. If the fill ever raced
-// real data, every recording would carry stuffing it did not need.
-func TestStallReaderPassesDataThrough(t *testing.T) {
+// A stream that is flowing must pass through byte-exact, with nothing added,
+// dropped or reordered.
+func TestIdleReaderPassesDataThrough(t *testing.T) {
 	pr, pw := io.Pipe()
-	sr := newStallReader(&config{tuner: "T"}, pr, 50*time.Millisecond, 5*time.Second)
+	r := newIdleReader(&config{tuner: "T"}, pr, 5*time.Second)
 
 	want := buildStream(4, 10)
 	go func() {
@@ -79,7 +70,7 @@ func TestStallReaderPassesDataThrough(t *testing.T) {
 		_ = pw.Close()
 	}()
 
-	got, err := io.ReadAll(sr)
+	got, err := io.ReadAll(r)
 	if err != nil && err != io.EOF {
 		t.Fatalf("reading: %v", err)
 	}
@@ -88,42 +79,41 @@ func TestStallReaderPassesDataThrough(t *testing.T) {
 	}
 }
 
-// Filling must be bounded. An encoder that never comes back would otherwise
-// produce a recording of nulls that never ends, and the tuner slot would be
-// held until the DVR gave up.
-func TestStallReaderFailsOnceQuietOutrunsTheBudget(t *testing.T) {
+// Nothing may be held back. Whatever has arrived must be available at once, or
+// this layer has become the buffer it must never be.
+func TestIdleReaderHoldsNothingBack(t *testing.T) {
 	pr, pw := io.Pipe()
-	defer pw.Close()
-	sr := newStallReader(&config{tuner: "T"}, pr, 10*time.Millisecond, 60*time.Millisecond)
+	defer pr.Close()
+	r := newIdleReader(&config{tuner: "T"}, pr, 5*time.Second)
 
-	b := make([]byte, tsPacketSize)
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if time.Now().After(deadline) {
-			t.Fatal("the reader filled past its budget instead of failing")
-		}
-		if _, err := sr.Read(b); err != nil {
-			if !strings.Contains(err.Error(), "sent nothing") {
-				t.Errorf("failed with %v, want the silence to be named", err)
-			}
-			return
-		}
+	pkt := buildStream(1, 10)
+	go func() { _, _ = pw.Write(pkt) }()
+
+	b := make([]byte, 4096)
+	start := time.Now()
+	n, err := r.Read(b)
+	if err != nil {
+		t.Fatalf("reading: %v", err)
+	}
+	if n != len(pkt) {
+		t.Errorf("read %d of %d bytes that had already arrived", n, len(pkt))
+	}
+	if waited := time.Since(start); waited > 50*time.Millisecond {
+		t.Errorf("waited %v for data that was already there", waited)
 	}
 }
 
-// The budget is measured over the silence, not over the connection: a stream
+// READ_TIMEOUT is measured over the silence, not over the connection: a stream
 // that keeps arriving must never trip it, however long the recording runs.
-func TestStallReaderBudgetResetsOnData(t *testing.T) {
+func TestIdleReaderBudgetResetsOnData(t *testing.T) {
 	pr, pw := io.Pipe()
-	sr := newStallReader(&config{tuner: "T"}, pr, 10*time.Millisecond, 50*time.Millisecond)
 	defer pr.Close()
+	r := newIdleReader(&config{tuner: "T"}, pr, 120*time.Millisecond)
 
 	pkt := buildStream(1, 10)
-	// Quiet for longer than the gap, but never for longer than the budget. The
-	// writer stops when the test closes the read end under it.
 	go func() {
 		for {
-			time.Sleep(25 * time.Millisecond)
+			time.Sleep(30 * time.Millisecond)
 			if _, err := pw.Write(pkt); err != nil {
 				return
 			}
@@ -131,9 +121,9 @@ func TestStallReaderBudgetResetsOnData(t *testing.T) {
 	}()
 
 	b := make([]byte, tsPacketSize)
-	deadline := time.Now().Add(300 * time.Millisecond)
+	deadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(deadline) {
-		if _, err := sr.Read(b); err != nil {
+		if _, err := r.Read(b); err != nil {
 			t.Fatalf("budget tripped on a stream that kept arriving: %v", err)
 		}
 	}
