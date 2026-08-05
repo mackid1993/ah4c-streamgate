@@ -1205,18 +1205,23 @@ func TestMainEncoderFailures(t *testing.T) {
 		onTimeout string
 		wantLog   string
 	}{
+		// With ON_TIMEOUT=fail the encoder is never even connected -- it is
+		// deliberately left untouched during detection so its buffer fills --
+		// and the failing tune names the fail-safe, not the encoder.
 		{"non-200, ON_TIMEOUT=fail", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusServiceUnavailable)
-		}, "fail", "encoder returned 503"},
+		}, "fail", "failing the tune"},
+		// With ON_TIMEOUT=stream curl does the fetch and its own stderr names
+		// the status, next to streamgate's retry lines.
 		{"non-200, ON_TIMEOUT=stream", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusServiceUnavailable)
-		}, "stream", "encoder returned 503"},
+		}, "stream", "503"},
 		{"200 with an empty body, ON_TIMEOUT=fail", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
-		}, "fail", "encoder sent no video"},
+		}, "fail", "failing the tune"},
 		{"200 with an empty body, ON_TIMEOUT=stream", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
-		}, "stream", "encoder sent no video"},
+		}, "stream", "nothing emitted yet"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1243,37 +1248,36 @@ func TestMainEncoderFailures(t *testing.T) {
 	}
 }
 
-// The encoder dies while detection is still running. Before the gate opens that
-// is recoverable -- every byte is being discarded anyway -- so streamgate
-// redials rather than latching the failure and killing a tune whose box then
-// comes up fine. It must still say the encoder was the problem, and it must
-// still put zero bytes on the wire when detection then times out.
-func TestMainEncoderDiesDuringDetection(t *testing.T) {
-	for _, onTimeout := range []string{"fail", "stream"} {
-		t.Run("ON_TIMEOUT="+onTimeout, func(t *testing.T) {
-			hNewADB(t, hStep{fail: true})
-			// 30 packets and then EOF, well inside the 1s TUNE_TIMEOUT.
-			srv := hServeTS(t, buildStream(30, 10), time.Millisecond, 1)
-			env := hEnv(srv.URL)
-			env["ON_TIMEOUT"] = onTimeout
-			res := hRunMain(t, env)
+// The encoder cannot deliver a picture when the gate opens: each connect
+// serves a token 30 packets with no keyframe reachable and ends. That must be
+// redialled -- bounded -- rather than latched as instant failure, it must name
+// the encoder, and it must put zero bytes on the wire, because nothing
+// decodable ever arrived. (The old shape of this test -- an encoder dying
+// DURING detection -- is unobservable now: the encoder is deliberately left
+// unconnected until the gate so its buffer fills for the connect burst.)
+func TestMainEncoderDiesAtTheGate(t *testing.T) {
+	hNewADB(t,
+		hStep{ids: []string{"OLD"}, session: hStopped},
+		hStep{ids: []string{"OLD", "NEW"}, session: hPlaying},
+	)
+	// One pass of 30 packets per connect: tables and a stub of video that ends
+	// before alignment can find a keyframe worth starting on.
+	srv := hServeTS(t, buildStream(30, 100), time.Millisecond, 1)
+	env := hEnv(srv.URL)
+	env["TUNE_TIMEOUT"] = "5s"
+	res := hRunMain(t, env)
 
-			// ON_TIMEOUT=fail must put nothing on the wire. ON_TIMEOUT=stream is
-			// the documented "send whatever is there" mode, so once the gate opens
-			// a successful redial legitimately produces bytes.
-			if onTimeout == "fail" && len(res.stdout) != 0 {
-				t.Errorf("%d bytes on stdout with the fail-safe on, want 0", len(res.stdout))
-			}
-			if res.code != 1 {
-				t.Errorf("exit %d, want 1\n%s", res.code, res.stderr)
-			}
-			if !strings.Contains(res.stderr, "encoder") {
-				t.Errorf("stderr never mentions the encoder:\n%s", res.stderr)
-			}
-			if !strings.Contains(res.stderr, "redialling") {
-				t.Errorf("encoder failure before the gate was latched instead of retried:\n%s", res.stderr)
-			}
-		})
+	if len(res.stdout) != 0 {
+		t.Errorf("%d bytes on stdout for a tune that never carried a keyframe, want 0", len(res.stdout))
+	}
+	if res.code != 1 {
+		t.Errorf("exit %d, want 1\n%s", res.code, res.stderr)
+	}
+	if !strings.Contains(res.stderr, "encoder") {
+		t.Errorf("stderr never mentions the encoder:\n%s", res.stderr)
+	}
+	if !strings.Contains(res.stderr, "redialling") {
+		t.Errorf("a dead encoder at the gate was latched instead of retried:\n%s", res.stderr)
 	}
 }
 

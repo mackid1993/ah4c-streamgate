@@ -75,7 +75,6 @@ type config struct {
 	tuner         string
 	tunerIP       string
 	encoderURL    string
-	delivery      string
 	minWait       time.Duration
 	tuneTimeout   time.Duration
 	confirm       int
@@ -244,23 +243,6 @@ func warnEnv(k, v, why string) {
 	fmt.Fprintf(os.Stderr, "streamgate: ignoring %s=%q -- %s; using the default\n", k, v, why)
 }
 
-// deliveryMode selects who moves the stream bytes once the gate opens: the
-// internal gated path, or the bundled curl exec'd at gate time. Validated the
-// same way as ON_TIMEOUT, because a typo here must not silently change how
-// every recording is delivered.
-func deliveryMode() string {
-	v := strings.ToLower(envRaw("DELIVERY"))
-	switch v {
-	case "":
-		return "internal"
-	case "internal", "curl":
-		return v
-	default:
-		warnEnv("DELIVERY", v, "want curl or internal")
-		return "internal"
-	}
-}
-
 // onTimeoutMode validates the fail-safe rather than accepting anything. It was
 // the only setting read without a warn path, so a typo -- ON_TIMEOUT=fial --
 // silently turned the fail-safe OFF and streamed a loading screen for the length
@@ -292,7 +274,6 @@ func loadConfig() (*config, error) {
 		// out the full TUNE_TIMEOUT while the log blamed the port.
 		tunerIP:     envRaw("TUNER" + n + "_IP"),
 		encoderURL:  envRaw("ENCODER" + n + "_URL"),
-		delivery:    deliveryMode(),
 		minWait:     envDurOff("MIN_WAIT", 1*time.Second),
 		tuneTimeout: envDur("TUNE_TIMEOUT", 40*time.Second),
 		confirm:     envInt("CONFIRM", 1),
@@ -1750,61 +1731,25 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	gate := make(chan struct{})
-	streamErr := make(chan error, 1)
-
-	// Open the encoder now, during the detection wait, so the handoff costs
-	// nothing. Bytes received before the gate opens are discarded, never emitted.
-	//
-	// DELIVERY=curl inverts the trade on purpose: the encoder is left untouched
-	// until the gate opens, so its internal buffer fills during the wait and
-	// arrives as one burst -- the live cushion the held-open connection here
-	// structurally consumes.
-	if c.delivery == "internal" {
-		go func() { streamErr <- stream(ctx, c, gate) }()
-	}
-
+	// The encoder is deliberately NOT touched during the detection wait: an
+	// unconnected encoder accumulates its internal buffer, and that buffer --
+	// burst-delivered at connect and trimmed to post-gate footage -- is the
+	// live cushion every tune starts with. See streamCurl.
+	gated := false
 	if c.tunerIP == "" {
 		logf(c, "TUNER%s_IP not set -- no gate", c.tuner)
-		close(gate)
 	} else if err := waitForVideo(ctx, c); err != nil {
-		// Surface an encoder failure that already happened, rather than blaming
-		// the box. Without this the only log is "no playback after 40s" while the
-		// real fault was a dead encoder noticed 40 seconds ago.
 		logf(c, "%v", err)
 		if c.onTimeout == "fail" {
 			logf(c, "failing the tune rather than streaming whatever is on screen")
-			cancel()
 			os.Exit(1)
 		}
-		close(gate)
 	} else {
 		// The decoder exists, but on a tunneled pipeline nothing is on screen
-		// until audio starts. Keyframe alignment removed the slack that used to
-		// hide that gap, so confirm render before opening the gate.
+		// until audio starts. WAIT_AUDIO confirms render before the gate, which
+		// tightens the trim margin's job.
 		waitForRender(ctx, c)
-		close(gate)
+		gated = true
 	}
-
-	// Every path above that reaches here has closed the gate, so in curl
-	// delivery this is the handoff moment: exec the bundled curl and let it own
-	// the recording end to end.
-	if c.delivery == "curl" {
-		os.Exit(streamViaCurl(ctx, c))
-	}
-
-	// stream() cannot return before the gate opens -- it redials instead -- so
-	// there is exactly one value here and exactly one receive. The earlier
-	// non-blocking drain became unreachable when the redial loop landed, and the
-	// encoder failure it used to surface is now logged by the loop itself.
-	err = <-streamErr
-	switch {
-	case err == nil, ctx.Err() != nil:
-	case errors.Is(err, syscall.EPIPE), errors.Is(err, os.ErrClosed):
-		// The DVR hung up. That is how a recording normally ends.
-		logf(c, "stream closed by the DVR")
-	default:
-		logf(c, "stream ended: %v", err)
-		os.Exit(1)
-	}
+	os.Exit(streamCurl(ctx, c, gated))
 }

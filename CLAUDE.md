@@ -40,15 +40,25 @@ is the authority.
 
 ## Bundled curl
 
+Delivery is curl-only: `streamCurl` in `curl.go` is the sole production
+stream path (connect at gate time, burst trim on PCR, then a straight copy).
 `third_party/` carries pinned static curl binaries (musl builds; provenance
 and checksums in `third_party/README.md`), embedded per release architecture
-by the build-tagged `curl_embed_*.go` files and unpacked at runtime by
-`DELIVERY=curl`. Non-linux builds embed nothing and fail that mode loudly at
-runtime. To update: fetch the new release's musl tarballs, verify each `curl`
-against the SHA256SUMS inside its tarball, replace the binaries, bump
-`curlVersion` in `curl.go`, and refresh the provenance table.
-`TestBundledCurlRuns` execs the embedded binary, so it only runs on linux —
-one more reason the manual CI dispatch is the release gate.
+by the build-tagged `curl_embed_*.go` files and unpacked at tune time.
+Non-linux builds embed nothing and fail loudly at stream time. To update:
+fetch the new release's musl tarballs, verify each `curl` against the
+SHA256SUMS inside its tarball, replace the binaries, bump `curlVersion` in
+`curl.go`, and refresh the provenance table. `TestBundledCurlRuns` execs the
+embedded binary, so it only runs on linux — one more reason the manual CI
+dispatch is the release gate.
+
+The old internal HTTP delivery path (`stream`/`streamOnce`, the motion gate,
+the drain) is no longer reachable from `main` but is deliberately retained:
+its tests exercise the TS parsing, alignment and PSI machinery that
+`deliver` reuses, and its comments carry field-verified hardware behaviour.
+Its env knobs (`WAIT_MOTION`, `MOTION_*`, `DRAIN_IDLE`, `ALIGN_KEYFRAME`,
+`REARM_MOTION`) still parse but are inert and are no longer documented in
+the README.
 
 ## CI and releases
 
