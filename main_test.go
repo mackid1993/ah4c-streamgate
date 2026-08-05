@@ -12,6 +12,20 @@ import (
 	"time"
 )
 
+// The in-process streaming tests drive streamOnce against an httptest server,
+// so they take the in-process source rather than exec'ing the bundled curl:
+// that keeps them running on any platform and keeps them about the TS
+// machinery, which is what they exist to cover.
+//
+// Deliberately NOT applied in the subprocess: hRunMain re-executes this binary
+// with SG_SUBPROCESS=1 to run main(), and the whole point of that harness is
+// that the production path runs exactly as shipped -- curl and all.
+func init() {
+	if os.Getenv("SG_SUBPROCESS") != "1" {
+		openStream = openViaHTTP
+	}
+}
+
 func TestEnvDur(t *testing.T) {
 	const def = 6 * time.Second
 	cases := []struct {

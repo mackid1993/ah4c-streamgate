@@ -6,6 +6,8 @@ Without it, recording starts the moment the tuner is reserved — so the first s
 
 The video is never re-encoded. The encoder's bytes go through untouched.
 
+The encoder is fetched with a bundled static `curl`, so the HTTP side is handled by the tool that has spent thirty years learning how encoders misbehave. Its output is read by streamgate rather than written straight to your DVR, which is what makes everything below possible.
+
 > The original POSIX shell implementation lives on the [`bash`](../../tree/bash) branch and still works. This branch is a single static binary that does the same job plus three things a shell script structurally cannot: hold the encoder connection open during the wait, start the output on a keyframe, and guarantee that no picture received before the gate opened is ever emitted.
 
 ---
@@ -169,6 +171,24 @@ optimisation:
 
 Motion seen *before* the gate — the wake animation, the home screen, the app launching, the channel you're leaving — is never evidence about the new channel, so the latch is always dropped when the gate opens and motion must prove itself again on the new picture. The learned floor is kept, so a warm tune re-latches within `MOTION_HOLD` windows (~750ms at defaults, usually inside the keyframe wait it already pays) while the card, sitting at the floor, cannot. `REARM_MOTION=1` additionally forgets the floor itself — for apps whose pre-gate picture is so quiet that a kept floor would let the card read as a rise. Off by default; the same trade-off note below applies.
 
+## Riding out encoder stalls
+
+If the encoder sends nothing at all for 500ms, streamgate emits null packets in its place until real data resumes. Null packets are PID 0x1FFF: every demuxer discards them, so they can never reach a decoder, appear on screen, or disturb keyframe alignment or the motion measurement — both of which already ignore them. What they do is keep the bitstream continuous, so your DVR is never left to interpret an abrupt silence.
+
+**This never competes with padding your encoder already sends.** A constant-bitrate encoder pads with 0x1FFF to hold its mux rate steady, and that padding is *arriving bytes* — the stream is not silent, so this never fires. It fires only when nothing at all is arriving, which is the one case your encoder is definitionally not covering.
+
+Silence is still bounded. Once it has run past `READ_TIMEOUT` the recording fails loudly, rather than becoming an endless recording of nothing.
+
+Each gap is logged once, on the way out of it:
+
+```
+streamgate[1]: filled a 1.24s gap in the encoder's output with 3 null packet(s)
+```
+
+That line is also the point. It is **not** established that gaps are why a recording stutters — so if recordings stutter and you never see that line, the encoder going quiet is ruled out and the cause lies elsewhere.
+
+---
+
 ## Optional settings
 
 Everything here is optional, set the same way as the tuner variables — in the env file or under `environment:` in compose. Durations accept either seconds (`5`, `0.25`) or Go syntax (`10s`, `250ms`). A value that can't be parsed is ignored with a warning on stderr rather than silently falling back.
@@ -265,6 +285,8 @@ streamgate[1]: no playback after 40s (adb ok on 158/160 polls) -- nothing change
 | `encoder sent no picture for Ns, only padding and tables` | The encoder is muxing with nothing on its input — null padding and SI tables, no video. Exits 1 rather than shipping a dead mux to the DVR for the length of a programme. Check the HDMI input. |
 | `encoder sent no video (…)` | The encoder answered and then ended or died before a single video byte. Exits 1; nothing was written. |
 | `encoder ended the stream after X and Y MB` | The encoder closed mid-recording. However politely it closed, that truncates the recording, so it is logged and exits 1. |
+| `filled a Ns gap in the encoder's output with N null packet(s)` | The encoder stopped sending for longer than 500ms and the gap was filled so your DVR never saw the bitstream stop. One line per gap, logged once it has ended. |
+| `encoder sent nothing for Ns` | The silence outran `READ_TIMEOUT`, so filling stopped and the tune failed rather than recording nothing indefinitely. |
 | `stream closed by the DVR` | The normal end of every recording — the DVR hung up. Exits 0. |
 | `render confirmed after a further Nms` / `render not confirmed within Ns` | The `WAIT_AUDIO` gate: the new tune's audio track started, or the cap expired and the gate opened anyway. |
 | `no whole audio dump in 3 attempts; render falls back to any started media track` | The `WAIT_AUDIO` baseline could not be verified whole; the gate degrades to the identity-blind check rather than waiting on a baseline it cannot trust. |

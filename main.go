@@ -1023,6 +1023,67 @@ func (c *idleTimeoutConn) Read(b []byte) (int, error) {
 	return c.Conn.Read(b)
 }
 
+// openViaHTTP fetches the encoder in-process. Production uses curl instead --
+// see openViaCurl for why -- but this is what the streaming tests run against,
+// so they need no bundled binary and run on any platform.
+//
+// Two different hangs have to be closed off here.
+//
+// ResponseHeaderTimeout: an encoder that accepts the TCP connection but never
+// replies would otherwise park forever, with no log and no exit, while the DVR
+// waits. The dial timeout does not cover it -- the handshake succeeded.
+//
+// The read deadline is the more important one. Without it, an encoder that
+// keeps the connection open but stops sending -- lost HDMI input, a wedged
+// encode thread, a session limit hit mid-stream -- stalls the recording
+// permanently and silently. TCP keepalive does not catch it, because the peer
+// is still answering. Every successful read pushes the deadline out, so this
+// only fires on genuine silence.
+func openViaHTTP(ctx context.Context, c *config) (io.ReadCloser, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", c.encoderURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := dialer.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			return &idleTimeoutConn{Conn: conn, idle: c.readTimeout}, nil
+		},
+		ResponseHeaderTimeout: 10 * time.Second,
+		DisableCompression:    true,
+		MaxIdleConnsPerHost:   1,
+	}
+	resp, err := (&http.Client{Transport: tr}).Do(req)
+	if err != nil {
+		tr.CloseIdleConnections()
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		tr.CloseIdleConnections()
+		return nil, fmt.Errorf("encoder returned %s", resp.Status)
+	}
+	// Each attempt builds its own Transport, so reap it when the body closes.
+	// Without this every pre-gate redial parked one connection in an abandoned
+	// pool until its read deadline fired -- bounded, but pointless to carry.
+	return &httpStream{ReadCloser: resp.Body, tr: tr}, nil
+}
+
+type httpStream struct {
+	io.ReadCloser
+	tr *http.Transport
+}
+
+func (s *httpStream) Close() error {
+	err := s.ReadCloser.Close()
+	s.tr.CloseIdleConnections()
+	return err
+}
+
 // ------------------------------------------------------------------ streaming
 
 // stream opens the encoder and copies it to stdout. While nothing has been
@@ -1086,55 +1147,31 @@ func stream(ctx context.Context, c *config, gate <-chan struct{}) error {
 }
 
 func streamOnce(ctx context.Context, c *config, gate <-chan struct{}) (wrote bool, err error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", c.encoderURL, nil)
+	body, err := openStream(ctx, c)
 	if err != nil {
 		return false, err
 	}
-	// Two different hangs have to be closed off here.
+	defer body.Close()
+
+	// Everything the encoder sends passes through here on its way to stdout,
+	// and that is deliberate. Handing the descriptor to curl would be simpler
+	// and faster to write, but it would also hand over the encoder's pre-gate
+	// buffer verbatim -- the tail of the channel change, splash screen and all
+	// -- with nothing left in the process able to discard it. Staying in the
+	// path is what pays for the alignment below and the stall filling here.
 	//
-	// ResponseHeaderTimeout: an encoder that accepts the TCP connection but never
-	// replies would otherwise park forever, with no log and no exit, while the
-	// DVR waits. The dial timeout does not cover it -- the handshake succeeded.
-	//
-	// The read deadline is the more important one. Without it, an encoder that
-	// keeps the connection open but stops sending -- lost HDMI input, a wedged
-	// encode thread, a session limit hit mid-stream -- stalls the recording
-	// permanently and silently. TCP keepalive does not catch it, because the peer
-	// is still answering. Every successful read pushes the deadline out, so this
-	// only fires on genuine silence.
-	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	tr := &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			conn, err := dialer.DialContext(ctx, network, addr)
-			if err != nil {
-				return nil, err
-			}
-			return &idleTimeoutConn{Conn: conn, idle: c.readTimeout}, nil
-		},
-		ResponseHeaderTimeout: 10 * time.Second,
-		DisableCompression:    true,
-		MaxIdleConnsPerHost:   1,
-	}
-	// Each attempt builds its own Transport, so reap it on the way out. Without
-	// this every pre-gate redial parked one connection in an abandoned pool until
-	// its read deadline fired -- bounded, but pointless to carry.
-	defer tr.CloseIdleConnections()
-	resp, err := (&http.Client{Transport: tr}).Do(req)
-	if err != nil {
-		return false, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("encoder returned %s", resp.Status)
-	}
+	// READ_TIMEOUT is enforced by the stall reader, over the whole connection:
+	// short silences are filled with null packets so the DVR never sees the
+	// bitstream stop, and quiet that outruns the budget fails the read.
+	sr := newStallReader(c, body, stallGap, c.readTimeout)
 
 	sent := 0
 	// 8KB, not 64KB. Whatever sits in this buffer is video we have taken off the
-	// socket but not yet emitted, so its size is a ceiling on how far behind live
+	// pipe but not yet emitted, so its size is a ceiling on how far behind live
 	// we can be. At a typical 3-4 Mbps, 64KB is ~160ms of held video; 8KB is
 	// ~20ms. The cost is more read syscalls -- about 50/sec instead of 6 -- which
 	// at ~1us each is nothing.
-	br := bufio.NewReaderSize(resp.Body, 1<<13)
+	br := bufio.NewReaderSize(sr, 1<<13)
 
 	// Coalesce writes without ever holding video back.
 	//
