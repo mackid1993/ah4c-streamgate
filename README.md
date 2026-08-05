@@ -15,7 +15,7 @@ The video is never re-encoded. The encoder's bytes go through untouched.
 Three properties hold on every code path. They are structural, not configuration:
 
 - **stdout carries nothing but stream bytes.** The stream is fetched by the bundled curl and written to stdout untouched after the head trim; every log line — streamgate's and curl's — goes to stderr. There is no mode, flag or failure in which diagnostics can leak into the recording.
-- **It never emits picture from before the gate opened.** The connect burst is trimmed on the stream's own clock so that only footage younger than the gate (plus a render margin) survives, and when the stream carries no clock to trim by, the whole burst is discarded rather than trusted. The one exception is the cached PAT/PMT injected at the head — program tables, not video. *(The ungated modes — no `TUNERn_IP`, or `ON_TIMEOUT=stream` — send whatever is on screen by definition, as they always did.)*
+- **It never emits picture from before the gate opened.** Everything that arrives inside the render margin past the gate — including the encoder's buffered cache of the channel change, delivered as a burst at connect — is discarded, and output starts on the first keyframe after it. The one exception is the cached PAT/PMT injected at the head — program tables, not video. *(The ungated modes — no `TUNERn_IP`, or `ON_TIMEOUT=stream` — send whatever is on screen by definition, as they always did.)*
 - **It never re-encodes, remuxes or edits.** Once the first byte is out, everything passes through byte-exact.
 
 ---
@@ -110,55 +110,46 @@ Both rest on the baseline being real, so the timing baseline is taken by the fir
 
 H.264 in an MPEG-TS stream is mostly P and B frames, which are differences against earlier frames. Only an **IDR keyframe** stands alone: attach partway between keyframes and the decoder throws everything away until the next one. Encoders emit keyframes on a fixed cycle — every 2 seconds is typical — so a random attach point costs anywhere from zero to a full cycle, redrawn every tune. That is why the same box on the same channel can feel instant once and sluggish the next time.
 
-streamgate therefore never starts the output mid-GOP: the kept footage from the connect burst is emitted from its first keyframe, prefixed with the newest PAT and PMT seen, so your DVR decodes from the very first packet instead of waiting for the encoder's next keyframe and table cycle. If the kept footage holds no recognisable keyframe, streamgate aligns on the live stream instead — bounded by `ALIGN_TIMEOUT` plus 2s of grace, after which it streams unaligned rather than produce no output at all.
+streamgate therefore never starts the output mid-GOP: it starts on the first keyframe past the render margin, prefixed with the newest PAT and PMT seen, so your DVR decodes from the very first packet instead of waiting for the encoder's next keyframe and table cycle. If no keyframe is recognised, the hunt is bounded by `ALIGN_TIMEOUT` plus 2s of grace, after which it streams unaligned rather than produce no output at all.
 
 ## How the stream is delivered
 
-Once the gate opens, a statically linked curl 8.21.0 — compiled into the
-binary, unpacked at tune time — fetches the encoder, and streamgate shapes
-only the head of what it returns. Three deliberate steps make tunes fast,
-clean *and* buffer-resistant at once:
+The moment the gate opens, a statically linked curl 8.21.0 — compiled into
+the binary, unpacked at tune time — connects to the encoder and fetches the
+stream; streamgate shapes only the head of what it returns:
 
-1. **The encoder is left unconnected until after the gate.** While streamgate
-   watches the box, the encoder quietly fills its internal buffer with footage
-   of the *new* channel playing. streamgate then waits a further ~3s on
-   purpose before connecting, so that buffer holds a run of clean footage
-   spanning at least one full GOP even on a 60fps encoder with a 2-second
-   keyframe cycle.
+1. **The connect burst is discarded.** The encoder was never touched during
+   the detection wait, so whatever its internal buffer held — footage of the
+   channel change — arrives in the first instants and is dropped, along with
+   everything else inside a 1-second render margin measured from the gate.
+   The margin covers the lag between the box allocating its decoder (which is
+   what detection sees) and real pixels reaching the screen, so the tuning
+   card cannot reach the output. While this head-shaping runs, the pipe is
+   kept warm with MPEG-TS null padding — clock, no picture — so your DVR's
+   connection and probe overlap these waits instead of following them.
+   Padding starts only after detection succeeded: a failing tune still puts
+   zero bytes on the wire.
 
-2. **The burst is trimmed to the newest clean keyframe.** When curl connects,
-   that buffer arrives in one burst. streamgate reads the stream's own clock
-   (the PCR) and discards everything older than the safe window — which by
-   construction covers every byte from before the gate plus a 0.75s render
-   margin, so the channel-change tail structurally cannot reach the output.
-   From what survives it starts on the **newest** keyframe, with the newest
-   PAT/PMT in front. You therefore run behind live only by the distance from
-   that keyframe to the live edge — a random point inside one GOP of your
-   encoder, so a 2-second GOP (the 60fps default on many encoders) averages
-   about a second and a short GOP proportionally less. That same distance is
-   your stall cushion: latency behind live and hiccup protection are
-   physically the same footage, and starting on the newest clean keyframe is
-   as close to live as a clean start can possibly be. **The one lever that
-   genuinely shrinks it is your encoder's GOP setting** — at 60fps, a
-   60-frame GOP halves the bound to 1s and a 30-frame GOP to 0.5s, at the
-   cost of a little compression efficiency.
+2. **Output starts on the first keyframe past the margin**, with the newest
+   PAT/PMT in front so your DVR decodes from the very first packet. That is
+   the live edge: the tune completes as fast as a clean start structurally
+   can — the margin plus however long your encoder takes to mint the next
+   keyframe, so a shorter encoder GOP means faster tunes.
 
-3. **Then streamgate gets out of the way.** After the head, bytes pass through
-   untouched — a straight copy of curl's output.
+3. **Then streamgate gets out of the way.** Everything after the head is a
+   straight copy of curl's output — no parsing, no batching, no logic.
 
-The deliberate ~2.5s connect delay does not make tunes feel slower: your DVR
-probes the head of a stream before showing anything, and probing a burst
-completes in milliseconds where probing a live trickle costs its full length
-in real time. In practice the picture appears as fast or faster than before.
-
-If the stream carries no PCR clock, the burst cannot be safely trimmed — so it
-is discarded whole and the tune starts from live with no cushion: the safe
-direction is a clean start, never a cushion that might carry the card. A tune
-with no gate (`TUNERn_IP` unset) or a failed detection with
-`ON_TIMEOUT=stream` skips all of this and streams as-is, which is what those
-modes have always meant. `READ_TIMEOUT` maps onto curl's own low-speed abort —
-below 1000 bytes/s for that long ends the tune — so a wedged encoder cannot
-hold the tuner slot forever.
+Starting at the live edge is a deliberate trade, stated plainly: **there is
+no stall cushion.** Buffering protection, seconds behind live, and extra tune
+seconds are the same number spent three ways, and this build spends none of
+it — an encoder hiccup longer than your player's own small buffer will
+surface as a brief stall. The cure for those is at the source: an encoder
+that isn't wedged, CBR instead of VBR, a stable HDMI link. A tune with no
+gate (`TUNERn_IP` unset) or a failed detection with `ON_TIMEOUT=stream`
+skips the head shaping and streams as-is, which is what those modes have
+always meant. `READ_TIMEOUT` maps onto curl's own low-speed abort — below
+1000 bytes/s for that long ends the tune — so a wedged encoder cannot hold
+the tuner slot forever.
 
 ## Optional settings
 
@@ -181,7 +172,7 @@ The defaults are tuned; most people should never touch these.
 | `MIN_WAIT` | `1` | Ignore "playing" for this many seconds after start. `0` accepts a sighting on the first poll. |
 | `TUNE_TIMEOUT` | `40` | Give up after this long. Costs nothing on a tune that works — the wait ends the moment playback is detected. |
 | `ON_TIMEOUT` | `fail` | `fail` exits without streaming, so your DVR sees a dead tune and can retry or pick another tuner. `stream` sends whatever is on screen instead; `continue` is accepted as an alias of `stream`. An unrecognised value warns and keeps `fail` — a typo here used to disable the fail-safe silently. |
-| `ALIGN_TIMEOUT` | `8` | When the kept footage holds no recognisable keyframe, how long to hunt for one on the live stream (plus 2s of grace) before streaming unaligned rather than stalling. |
+| `ALIGN_TIMEOUT` | `8` | How long past the render margin to hunt for a keyframe (plus 2s of grace) before streaming unaligned rather than stalling. |
 | `WAIT_AUDIO` | `0` | After the decoder appears, also wait for audio playback to start. Costs ~0.7s. Only needed if a flash survives `SETTLE` — it pins the exact moment the new channel renders, which the trim margin otherwise covers statistically. |
 | `RENDER_TIMEOUT` | `3` | Cap on that wait, so a device that never reports audio still tunes. |
 | `READ_TIMEOUT` | `10` | Give up when the encoder (nearly) stops sending: mapped onto curl's low-speed abort, below 1000 bytes/s for this long ends the tune. Catches a lost HDMI input or a wedged encode thread, which TCP keepalive does not — the peer is still answering. |
@@ -208,7 +199,7 @@ Every tune logs one detection line, the curl handoff line, and one alignment lin
 ```
 streamgate[1]: playback detected after 5s via codec 1284494944 (base none), 1 confirmation(s)
 streamgate[1]: fetching via bundled curl 8.21.0 (READ_TIMEOUT=10s maps to: abort below 1000 B/s for 10s)
-streamgate[1]: aligned in the connect burst: kept 812KB (~1.7s cushion), discarded 3402KB of pre-gate footage
+streamgate[1]: aligned at the live edge 1.42s after the gate (1.0s render margin + keyframe wait), discarded 512KB of pre-gate cache; stall cushion is zero by design
 ```
 
 What each number means:
@@ -217,14 +208,12 @@ What each number means:
 |---|---|
 | `playback detected after Ns` | time from the tuner being reserved until a decoder appeared. Mostly the box and the app; not much to do with this program. |
 | `via codec … (base …)` | which signal fired. `base` is what was allocated before tuning — a *changed* id is the proof of new playback. |
-| `kept … (~Ns behind live, which is also the stall cushion)` | **the number to watch.** How far behind live the tune starts, which is identically how much upstream hiccup it can absorb — the two are the same footage. It is the distance from the newest clean keyframe to the live edge, so it is bounded by your encoder's GOP cycle and varies tune to tune. |
-| `discarded … pre-gate and … behind the newest clean keyframe` | the two parts of the connect burst that are dropped: footage older than the gate plus the render margin (the channel-change tail your recording must never open on), and safe footage superseded by a newer keyframe. |
+| `aligned at the live edge Ns after the gate` | **the number to watch.** The whole cost of the clean start: the fixed render margin plus however long the encoder took to mint the next keyframe. A shorter encoder GOP shrinks the second part directly. |
+| `discarded … of pre-gate cache` | the encoder's buffered footage of the channel change, delivered as a burst at connect and dropped inside the margin — the tail your recording must never open on. |
 
-When the burst can't be used:
+When detection can't confirm anything:
 
 ```
-streamgate[1]: no usable PCR clock in the connect burst; starting from live without a cushion
-streamgate[1]: no keyframe in the kept footage; aligning on the live stream
 streamgate[1]: no playback after 40s (adb ok on 158/160 polls) -- nothing changed: baseline codec=none session=stopped, last poll codec=none session=stopped
 ```
 
@@ -233,10 +222,8 @@ streamgate[1]: no playback after 40s (adb ok on 158/160 polls) -- nothing change
 | line | what it means |
 |---|---|
 | `fetching via bundled curl …` | The gate opened and the bundled curl is fetching the encoder. curl runs with its errors visible, so a fetch problem prints curl's own message alongside streamgate's lines. |
-| `encoder unavailable, nothing emitted yet (attempt N: …); redialling` | The encoder refused or died before a single byte went out. Redials are bounded (3 attempts, capped by `READ_TIMEOUT`) so a dead encoder fails the tune instead of holding the DVR. |
-| `no usable PCR clock in the connect burst; starting from live without a cushion` | The stream carries no PCR (or it wrapped mid-burst), so the burst cannot be safely trimmed. The whole burst is discarded: a clean start outranks a cushion that might carry the card. |
-| `no keyframe in the kept footage; aligning on the live stream` | The kept window held no recognisable keyframe (a long GOP can outsize it). The cushion is lost but the start stays clean and aligned. |
-| `no keyframe recognised within Ns; streaming unaligned` | Alignment on the live stream also found nothing within `ALIGN_TIMEOUT`+2s — the encoder may not signal random access. Streams anyway rather than produce no output. |
+| `encoder unavailable, no picture emitted yet (attempt N: …); redialling` | The encoder refused or died before any picture went out (null padding may already be flowing). Redials are bounded (3 attempts, capped by `READ_TIMEOUT`) so a dead encoder fails the tune instead of holding the DVR. |
+| `no keyframe recognised within Ns of the margin; streaming unaligned` | No keyframe was found within `ALIGN_TIMEOUT`+2s past the render margin — the encoder may not signal random access. Streams anyway rather than produce no output. |
 | `no 188-byte sync grid in this stream; accepting bare sync bytes` | The response body doesn't look like MPEG-TS. streamgate relaxes rather than emit nothing, but check what the encoder URL actually returns — an HTML error page is a common culprit. |
 | `encoder sent no video (…)` | The encoder answered and then ended or died before anything decodable arrived. Exits 1; nothing was written. |
 | `encoder ended the stream` | The encoder closed mid-recording. However politely it closed, that truncates the recording, so it is logged and exits 1. |
@@ -282,13 +269,13 @@ streamgate[1]: t=1.2s codec=abc123 base=abc123 session=stopped armed=true hits=0
 
 **Recordings start with the tail of the previous channel.** The gate isn't running. Look for `TUNERn_IP not set -- no gate` at tuner start — a missing or misspelled `TUNERn_IP` disables detection without failing anything.
 
-**Tunes are slower than they used to be.** Three things add deliberate delay after playback is detected: `SETTLE` (0.25s), the ~2.5s cushion-building wait before the encoder is connected, and `WAIT_AUDIO` if you enabled it. The cushion wait usually *isn't felt* — the DVR's probe consumes the connect burst in milliseconds instead of real time — so if tunes still feel slow, the time went to detection (see the `playback detected after Ns` line) or somewhere downstream of this program.
+**Tunes are slower than they used to be.** Three things add deliberate delay after playback is detected: `SETTLE` (0.25s), the 1-second render margin, and `WAIT_AUDIO` if you enabled it. Past those, the tune is waiting for your encoder's next keyframe — the `aligned at the live edge Ns after the gate` line shows the total, and a shorter encoder GOP shrinks it directly. If that number is small and the tune still felt slow, the time went to detection (see `playback detected after Ns`) or somewhere downstream of this program.
 
-**A flash at the head of the recording.** See above — raise `SETTLE`, or set `WAIT_AUDIO=1`, which pins the exact render moment instead of relying on the trim margin.
+**A flash at the head of the recording.** See above — raise `SETTLE`, or set `WAIT_AUDIO=1`, which pins the exact render moment instead of relying on the margin.
 
 **Recording has sound but no picture.** Almost always upstream: confirm your encoder is actually carrying video.
 
-**Live TV still buffers.** Check the `kept … stall cushion` figure on the aligned line. The cushion equals the distance behind live — one second of protection costs one second of latency; that trade is physics, not implementation — and this build keeps it as small as a clean start allows, so it only absorbs hiccups shorter than roughly one GOP. If your upstream stalls for longer than the figure in the log, the spinner is real and upstream: a longer encoder GOP would deepen the cushion (at matching latency), and encoder-side fixes (CBR instead of VBR, a stable HDMI link) shrink the stalls themselves — the only cure that costs no latency at all. A stream with no PCR clock gets no cushion at all; the `no usable PCR clock` line says so explicitly.
+**Live TV buffers.** This build plays at the live edge with zero stall cushion, on purpose — buffering protection and latency behind live are the same seconds, and it spends none. Every upstream hiccup longer than your player's own small buffer is therefore visible, and the fix is at the source: reboot an encoder that has been up for months (wedged encoder sessions are real), prefer CBR over VBR so bitrate peaks can't outrun the link, and check the HDMI chain. If the hiccups can't be fixed at the source, the only remaining lever is trading latency back for cushion — which is a code change, deliberately not a setting.
 
 **Recordings end early.** Look at the exit line. `encoder ended the stream` means the encoder closed the connection mid-recording; `encoder fell below 1000 B/s` means it went (nearly) silent while holding the connection open. Both are the encoder's doing — streamgate never ends a recording on its own.
 

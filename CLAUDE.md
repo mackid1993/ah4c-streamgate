@@ -41,7 +41,8 @@ is the authority.
 ## Bundled curl
 
 Delivery is curl-only: `streamCurl` in `curl.go` is the sole production
-stream path (connect at gate time, burst trim on PCR, then a straight copy).
+stream path (connect at gate time, null-padded head shaping -- a 1s render
+margin then the first keyframe -- then a straight copy).
 `third_party/` carries pinned static curl binaries (musl builds; provenance
 and checksums in `third_party/README.md`), embedded per release architecture
 by the build-tagged `curl_embed_*.go` files and unpacked at tune time.

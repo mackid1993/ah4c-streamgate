@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -12,80 +13,49 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 )
+
+// nullPacket is one MPEG-TS null packet (pid 0x1FFF): valid stream bytes that
+// carry no picture. Used to keep the DVR's connection warm while the head is
+// being shaped.
+var nullPacket = func() []byte {
+	p := make([]byte, tsPacketSize)
+	p[0], p[1], p[2], p[3] = 0x47, 0x1f, 0xff, 0x10
+	for i := 4; i < tsPacketSize; i++ {
+		p[i] = 0xff
+	}
+	return p
+}()
 
 // curlVersion is the upstream release of the bundled static curl. Provenance
 // and checksums live in third_party/README.md.
 const curlVersion = "8.21.0"
 
-const (
-	// cushionBuild is how long the encoder is left unconnected after the gate,
-	// filling its internal buffer with NEW-channel footage. Connecting then
-	// delivers that footage as an instant burst; the start point is the newest
-	// clean keyframe in it. The wait does not slow the tune the way it looks
-	// like it should: the DVR probes the stream head before showing anything,
-	// and probing a burst completes in milliseconds where probing a live
-	// trickle costs its full length in real time.
-	//
-	// Sized so the safe window (cushionBuild - renderMargin) spans at least
-	// one full GOP of a 60fps/120-frame encoder -- 2 seconds, the common
-	// ceiling. A window narrower than the GOP contains no keyframe on some
-	// tunes, and those fall to the live-align path: slower first picture and
-	// no cushion at all.
-	cushionBuild = 3 * time.Second
-	// renderMargin is clipped off the oldest end of the kept footage. The gate
-	// fires on decoder allocation, which runs 0.6-0.8s ahead of the first
-	// rendered pixel on this hardware, so the first moments after the gate can
-	// still be the tuning card. Keeping only footage younger than
-	// cushionBuild-renderMargin makes the card structurally unable to reach
-	// the output on any tune where rendering began within the margin.
-	renderMargin = 750 * time.Millisecond
-	// burstIdle separates the encoder's buffered burst from live delivery: a
-	// packet that took this long to arrive came over the wire in real time,
-	// not out of a buffer. Wider than the internal drain's 500us because the
-	// bytes cross a child-process pipe with scheduler hops on both sides.
-	burstIdle = 2 * time.Millisecond
-	// The burst buffer is bounded by bytes and by wall clock so a pathological
-	// encoder can neither exhaust memory nor stall the tune.
-	maxBurstBytes = 32 << 20
-	maxBurstWait  = 3 * time.Second
-)
-
-// pcrSeconds returns the packet's Program Clock Reference in seconds, if it
-// carries one. The PCR is the encoder's own realtime clock, which is what
-// lets the head trim measure footage age without trusting arrival timing.
-func pcrSeconds(p []byte) (float64, bool) {
-	afc := (p[3] >> 4) & 0x03
-	if afc != 2 && afc != 3 {
-		return 0, false
-	}
-	afLen := int(p[4])
-	if afLen < 7 || p[5]&0x10 == 0 {
-		return 0, false
-	}
-	base := uint64(p[6])<<25 | uint64(p[7])<<17 | uint64(p[8])<<9 |
-		uint64(p[9])<<1 | uint64(p[10])>>7
-	return float64(base) / 90000, true
-}
-
-// streamCurl is the delivery path: the bundled curl fetches the encoder --
-// connected only after the gate, never before -- and its output is emitted
-// with exactly one intervention, at the head. gated says detection actually
-// confirmed playback; without it (no TUNERn_IP, or ON_TIMEOUT=stream) the
-// output is a straight copy of whatever the encoder sends, which is what
-// those modes have always meant.
+// startMargin is how long past the gate output may not begin. Detection fires
+// on decoder allocation, which runs 0.6-0.8s ahead of the first rendered
+// pixel on this hardware, so the first moments after the gate can still be
+// the tuning card; the margin also swallows the encoder's connect burst --
+// its buffered cache of the channel change, delivered in the first instants
+// -- and the encoder's own encode-to-wire lag. Output starts on the first
+// keyframe past the margin: the live edge, as fast as a clean start can be.
 //
-// The head intervention is what reconciles the cushion with a clean start.
-// The encoder's burst is buffered, and everything older than
-// cushionBuild-renderMargin -- measured on the stream's own PCR clock -- is
-// discarded: by construction that discard covers every byte from before the
-// gate plus the render margin, so the channel-change tail cannot reach the
-// output. What remains is new-channel footage, emitted from its first
-// keyframe with the newest tables in front so the DVR locks instantly, and
-// still ahead of real time: the player starts with the cushion in hand.
-// After the head, bytes pass through untouched.
+// There is deliberately NO stall cushion in this design. Cushion seconds,
+// seconds behind live, and extra tune seconds are the same number spent
+// three ways, and the choice here is to spend none: a hiccup at the encoder
+// longer than the player's own small buffer will surface as a stall, and the
+// cure for those is encoder-side (CBR, a stable HDMI link, a box that is not
+// wedged), not latency.
+const startMargin = time.Second
+
+// streamCurl is the delivery path: the bundled curl connects to the encoder
+// the moment the gate opens -- never before, so detection costs the encoder
+// nothing -- and its output is emitted with exactly one intervention, at the
+// head. gated says detection actually confirmed playback; without it (no
+// TUNERn_IP, or ON_TIMEOUT=stream) the output is a straight copy of whatever
+// the encoder sends, which is what those modes have always meant.
 //
 // READ_TIMEOUT maps onto curl's own low-speed abort so a wedged encoder
 // still fails loudly instead of holding the tuner slot forever.
@@ -106,14 +76,45 @@ func streamCurl(ctx context.Context, c *config, gated bool) int {
 		return 1
 	}
 
+	// The margin is anchored to the gate itself, not to the connect: a redial
+	// on a later attempt must not pay it again.
+	gateAt := time.Now()
+
+	// While the head is being shaped -- margin, connect, keyframe hunt -- the
+	// DVR is not left staring at a silent pipe: null packets keep the
+	// connection warm so its probe overlaps these waits instead of following
+	// them. Padding carries no picture and starts only on a gated tune, after
+	// detection succeeded -- a failing tune still puts zero bytes on the wire.
+	stopPad := func() {}
 	if gated {
-		// The whole point of not connecting yet: let the encoder buffer clean
-		// footage for the burst. See cushionBuild.
-		time.Sleep(cushionBuild)
+		var padWG sync.WaitGroup
+		padStop := make(chan struct{})
+		padWG.Add(1)
+		go func() {
+			defer padWG.Done()
+			chunk := bytes.Repeat(nullPacket, 7)
+			for {
+				select {
+				case <-padStop:
+					return
+				case <-time.After(50 * time.Millisecond):
+					if _, werr := stdoutW.Write(chunk); werr != nil {
+						return
+					}
+				}
+			}
+		}()
+		var once sync.Once
+		stopPad = func() {
+			once.Do(func() {
+				close(padStop)
+				padWG.Wait()
+			})
+		}
+		defer stopPad()
 	}
 
 	secs := int(math.Ceil(c.readTimeout.Seconds()))
-	start := time.Now()
 	for attempt := 1; ; attempt++ {
 		cmd := exec.CommandContext(ctx, bin,
 			"-sSN", "--fail",
@@ -135,7 +136,7 @@ func streamCurl(ctx context.Context, c *config, gated bool) int {
 				curlVersion, c.readTimeout, secs)
 		}
 
-		wrote, perr := deliver(c, pipe, gated)
+		wrote, perr := deliver(c, pipe, gated, gateAt, stopPad)
 		// deliver can return while curl still runs -- a write failure is the
 		// DVR hanging up, not curl ending. Kill is a no-op on a curl that has
 		// already exited (its status is preserved for Wait), so this reaps
@@ -165,11 +166,11 @@ func streamCurl(ctx context.Context, c *config, gated bool) int {
 		}
 		// Nothing emitted: the encoder refused or died at connect. The gate is
 		// open and the DVR is waiting, so retries are bounded.
-		if attempt > maxPostGateDials || time.Since(start) > c.readTimeout {
+		if attempt > maxPostGateDials || time.Since(gateAt) > startMargin+c.readTimeout {
 			logf(c, "stream ended: %v", perr)
 			return 1
 		}
-		logf(c, "encoder unavailable, nothing emitted yet (attempt %d: %v); redialling", attempt, perr)
+		logf(c, "encoder unavailable, no picture emitted yet (attempt %d: %v); redialling", attempt, perr)
 		select {
 		case <-ctx.Done():
 			logf(c, "stream ended: %v", perr)
@@ -179,10 +180,14 @@ func streamCurl(ctx context.Context, c *config, gated bool) int {
 	}
 }
 
-// deliver moves bytes from curl to stdout. Trimming runs only on a gated
-// tune; otherwise this is a plain copy from the first byte.
-func deliver(c *config, pipe io.Reader, trim bool) (wrote bool, err error) {
-	if !trim {
+// deliver moves bytes from curl to stdout. On a gated tune the head is
+// shaped: nothing but null padding is emitted inside the render margin, and
+// output starts on the first keyframe past it with the newest tables in
+// front. stopPad is called -- and waited on -- immediately before the first
+// real write, so padding can never interleave with picture. Ungated tunes are
+// a plain copy from the first byte.
+func deliver(c *config, pipe io.Reader, gated bool, gateAt time.Time, stopPad func()) (wrote bool, err error) {
+	if !gated {
 		n, err := io.Copy(stdoutW, pipe)
 		if err == nil {
 			// io.Copy reports a clean end as nil; the caller needs "the encoder
@@ -192,13 +197,8 @@ func deliver(c *config, pipe io.Reader, trim bool) (wrote bool, err error) {
 		return n > 0, err
 	}
 
-	// Phase 1: take the encoder's buffered burst into memory. Arrival timing
-	// tells buffered from live apart, exactly like the internal drain did: a
-	// buffered packet is handed over in microseconds, a live one has to wait
-	// for the encoder's real-time clock.
 	br := bufio.NewReaderSize(pipe, 1<<16)
 	pkt := make([]byte, tsPacketSize)
-	backlog := make([]byte, 0, 1<<20)
 	relaxed := false
 	warnedSync := false
 	warn := func() {
@@ -207,70 +207,10 @@ func deliver(c *config, pipe io.Reader, trim bool) (wrote bool, err error) {
 			logf(c, "no 188-byte sync grid in this stream; accepting bare sync bytes (is the encoder emitting MPEG-TS?)")
 		}
 	}
-	burstStart := time.Now()
-	var readErr error
-	for len(backlog)+tsPacketSize <= maxBurstBytes && time.Since(burstStart) < maxBurstWait {
-		t0 := time.Now()
-		if err := readPacket(br, pkt, &relaxed, warn); err != nil {
-			readErr = err
-			break
-		}
-		backlog = append(backlog, pkt...)
-		if time.Since(t0) > burstIdle && len(backlog) > tsPacketSize {
-			// This packet waited on the wire: the buffer is drained and we are
-			// at the live edge.
-			break
-		}
-	}
-	if len(backlog) == 0 {
-		if readErr == nil {
-			readErr = errors.New("no data in the connect burst")
-		}
-		return false, fmt.Errorf("encoder sent no video (%w)", readErr)
-	}
 
-	// Phase 2: find the safe boundary. Everything older than the safe window
-	// is from before the gate (plus the render margin) and is discarded
-	// unseen, whatever it contains.
-	keep := (cushionBuild - renderMargin).Seconds()
-	var firstPCR, lastPCR float64
-	havePCR := false
-	for i := 0; i+tsPacketSize <= len(backlog); i += tsPacketSize {
-		if v, ok := pcrSeconds(backlog[i : i+tsPacketSize]); ok {
-			if !havePCR {
-				firstPCR, havePCR = v, true
-			}
-			lastPCR = v
-		}
-	}
-	cut := len(backlog)
-	switch {
-	case !havePCR || lastPCR < firstPCR:
-		// No usable clock (or it wrapped mid-burst). The safe direction is a
-		// clean start with no cushion, never a cushion that might carry the
-		// card: discard the whole burst and continue from live.
-		logf(c, "no usable PCR clock in the connect burst; starting from live without a cushion")
-	case lastPCR-firstPCR <= keep:
-		// The encoder buffers less than the window we would keep, so the whole
-		// burst is younger than the cut. Keep all of it.
-		cut = 0
-	default:
-		target := lastPCR - keep
-		for i := 0; i+tsPacketSize <= len(backlog); i += tsPacketSize {
-			if v, ok := pcrSeconds(backlog[i : i+tsPacketSize]); ok && v >= target {
-				cut = i
-				break
-			}
-		}
-	}
-
-	// Phase 3: cache the newest tables, then start on the NEWEST keyframe in
-	// the safe region -- not the oldest. Latency behind live and stall cushion
-	// are the same number (the footage between the start keyframe and the live
-	// edge), and the newest clean keyframe minimises it: the tune starts as
-	// close to live as a clean start structurally allows, bounded by the
-	// encoder's own GOP spacing. The table and keyframe machinery is the same
-	// code the internal path proved out.
+	// The newest tables seen while discarding are injected at the head, so
+	// the DVR decodes from the very first packet instead of waiting for the
+	// encoder's next table cycle. Same machinery the internal path proved out.
 	var lastPAT, lastPMT []byte
 	pmtPids := map[uint16]bool{}
 	vidPids := map[uint16]bool{}
@@ -296,89 +236,54 @@ func deliver(c *config, pipe io.Reader, trim bool) (wrote bool, err error) {
 			}
 		}
 	}
-	kf := -1
-	for i := 0; i+tsPacketSize <= len(backlog); i += tsPacketSize {
-		p := backlog[i : i+tsPacketSize]
-		scanPSI(p)
-		if i >= cut && alignCandidate(p, pid(p), vidPids, pmtPids) {
-			kf = i
+
+	marginAt := gateAt.Add(startMargin)
+	huntUntil := marginAt.Add(c.alignTimeout + relaxWindow)
+	discarded := 0
+	aligned := false
+	for {
+		if rerr := readPacket(br, pkt, &relaxed, warn); rerr != nil {
+			return false, fmt.Errorf("encoder sent no video (%w)", rerr)
 		}
+		scanPSI(pkt)
+		now := time.Now()
+		if now.Before(marginAt) {
+			discarded++
+			continue
+		}
+		if alignCandidate(pkt, pid(pkt), vidPids, pmtPids) {
+			aligned = true
+			break
+		}
+		discarded++
+		if now.After(huntUntil) {
+			break
+		}
+	}
+	if !aligned {
+		logf(c, "no keyframe recognised within %s of the margin; streaming unaligned (encoder may not signal random access)",
+			c.alignTimeout+relaxWindow)
+		if rerr := readPacket(br, pkt, &relaxed, warn); rerr != nil {
+			return false, fmt.Errorf("encoder sent no video (%w)", rerr)
+		}
+	}
+	logf(c, "aligned at the live edge %.2fs after the gate (%.1fs render margin + keyframe wait), discarded %.0fKB of pre-gate cache; stall cushion is zero by design",
+		time.Since(gateAt).Seconds(), startMargin.Seconds(), float64(discarded*tsPacketSize)/1024)
+
+	head := make([]byte, 0, len(lastPAT)+len(lastPMT)+tsPacketSize)
+	head = append(head, lastPAT...)
+	head = append(head, lastPMT...)
+	head = append(head, pkt...)
+	stopPad()
+	wrote = true
+	if _, werr := stdoutW.Write(head); werr != nil {
+		return wrote, werr
 	}
 
-	emit := func(head []byte) error {
-		out := make([]byte, 0, len(lastPAT)+len(lastPMT)+len(head))
-		out = append(out, lastPAT...)
-		out = append(out, lastPMT...)
-		out = append(out, head...)
-		if len(out) > 0 {
-			wrote = true
-			if _, werr := stdoutW.Write(out); werr != nil {
-				return werr
-			}
-		}
-		return nil
-	}
-
-	if kf >= 0 {
-		cushion := 0.0
-		if havePCR {
-			if v, ok := firstPCRAt(backlog, kf); ok {
-				cushion = lastPCR - v
-			}
-		}
-		logf(c, "aligned in the connect burst: kept %.0fKB (~%.1fs behind live, which is also the stall cushion), discarded %.0fKB pre-gate and %.0fKB behind the newest clean keyframe",
-			float64(len(backlog)-kf)/1024, cushion, float64(cut)/1024, float64(kf-cut)/1024)
-		if werr := emit(backlog[kf:]); werr != nil {
-			return wrote, werr
-		}
-	} else {
-		// No keyframe in the kept window: wait for the next one live, bounded,
-		// rather than ship a head the DVR cannot decode. The cushion is lost
-		// but the start stays clean.
-		logf(c, "no keyframe in the kept footage; aligning on the live stream")
-		deadline := time.Now().Add(c.alignTimeout + relaxWindow)
-		aligned := false
-		for time.Now().Before(deadline) {
-			if err := readPacket(br, pkt, &relaxed, warn); err != nil {
-				if !wrote {
-					return false, fmt.Errorf("encoder sent no video (%w)", err)
-				}
-				return wrote, err
-			}
-			scanPSI(pkt)
-			if alignCandidate(pkt, pid(pkt), vidPids, pmtPids) {
-				aligned = true
-				break
-			}
-		}
-		if !aligned {
-			logf(c, "no keyframe recognised within %s; streaming unaligned", c.alignTimeout+relaxWindow)
-			if err := readPacket(br, pkt, &relaxed, warn); err != nil {
-				return wrote, err
-			}
-		}
-		if werr := emit(pkt); werr != nil {
-			return wrote, werr
-		}
-	}
-	if readErr != nil {
-		return wrote, readErr
-	}
-
-	// Phase 4: out of the way. Everything from here is a straight copy.
+	// Out of the way: everything from here is a straight copy.
 	_, err = io.Copy(stdoutW, br)
 	if err == nil {
 		err = io.EOF
 	}
 	return true, err
-}
-
-// firstPCRAt returns the first PCR at or after byte offset i.
-func firstPCRAt(b []byte, i int) (float64, bool) {
-	for ; i+tsPacketSize <= len(b); i += tsPacketSize {
-		if v, ok := pcrSeconds(b[i : i+tsPacketSize]); ok {
-			return v, true
-		}
-	}
-	return 0, false
 }

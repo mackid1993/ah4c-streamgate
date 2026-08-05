@@ -1221,7 +1221,7 @@ func TestMainEncoderFailures(t *testing.T) {
 		}, "fail", "failing the tune"},
 		{"200 with an empty body, ON_TIMEOUT=stream", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
-		}, "stream", "nothing emitted yet"},
+		}, "stream", "no picture emitted yet"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1267,8 +1267,14 @@ func TestMainEncoderDiesAtTheGate(t *testing.T) {
 	env["TUNE_TIMEOUT"] = "5s"
 	res := hRunMain(t, env)
 
-	if len(res.stdout) != 0 {
-		t.Errorf("%d bytes on stdout for a tune that never carried a keyframe, want 0", len(res.stdout))
+	// A gated tune pads the pipe with nulls while the head is shaped, so bytes
+	// on stdout are fine -- PICTURE is not. Every packet must be null padding.
+	for i := 0; i+tsPacketSize <= len(res.stdout); i += tsPacketSize {
+		if pid(res.stdout[i:i+tsPacketSize]) != 0x1fff {
+			t.Errorf("packet %d on stdout has pid %d for a tune that never carried a keyframe; only null padding may go out",
+				i/tsPacketSize, pid(res.stdout[i:i+tsPacketSize]))
+			break
+		}
 	}
 	if res.code != 1 {
 		t.Errorf("exit %d, want 1\n%s", res.code, res.stderr)
@@ -1405,12 +1411,23 @@ func TestMainGateOpensThenTheDVRHangsUp(t *testing.T) {
 	}
 	_ = w.Close()
 
-	// Read a few packets, then hang up like a DVR that stopped the recording.
-	got := make([]byte, 4*tsPacketSize)
-	if _, err := io.ReadFull(r, got); err != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		t.Fatalf("reading the stream: %v\n%s", err, se.String())
+	// Null padding precedes the head while alignment runs; skim past it to the
+	// first real packet, then hang up like a DVR that stopped the recording.
+	got := make([]byte, tsPacketSize)
+	for i := 0; ; i++ {
+		if _, err := io.ReadFull(r, got); err != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			t.Fatalf("reading the stream (packet %d): %v\n%s", i, err, se.String())
+		}
+		if pid(got) != 0x1fff {
+			break
+		}
+		if i > 5000 {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			t.Fatalf("nothing but null padding in %d packets\n%s", i, se.String())
+		}
 	}
 	_ = r.Close()
 
